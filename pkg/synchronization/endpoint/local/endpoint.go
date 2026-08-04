@@ -344,7 +344,10 @@ func NewEndpoint(
 	} else if rawCache.EnsureValid() != nil {
 		rawCache = &core.Cache{}
 	}
-	cache := core.NewScanCacheFromProto(rawCache)
+	// Intern the freshly loaded cache's shards against the daemon-wide table:
+	// the cache is exclusively owned here, and endpoints watching the same
+	// root load identical caches.
+	cache := core.SharedCacheInterner().InternScanCache(core.NewScanCacheFromProto(rawCache))
 
 	// Check if this endpoint is running inside a sidecar container and, if so,
 	// whether or not the root exists beneath a volume mount point (which it
@@ -963,6 +966,12 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	// Subtrees spliced in from the previous (already canonical) snapshot are
 	// traversed write-free.
 	snapshot.Content = core.SharedInterner().Intern(snapshot.Content)
+
+	// Intern the caches' shards likewise, before publication, while their
+	// outer maps are exclusively owned. This collapses unchanged directories
+	// across cache generations and across endpoints watching the same root.
+	newCache = core.SharedCacheInterner().InternScanCache(newCache)
+	newIgnoreCache = core.SharedCacheInterner().InternIgnoreCache(newIgnoreCache)
 
 	// Update the snapshot.
 	e.snapshot = snapshot

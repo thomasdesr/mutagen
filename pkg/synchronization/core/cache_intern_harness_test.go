@@ -233,8 +233,8 @@ func sameScanCacheEntry(a, b *ScanCacheEntry) bool {
 // only two that need touching if shards acquire a wrapper type.
 func scanCachePaths(c *ScanCache) []string {
 	var paths []string
-	for directory, names := range c.directories {
-		for name := range names {
+	for directory, shard := range c.directories {
+		for name := range shard.entries {
 			if directory == "" {
 				paths = append(paths, name)
 			} else {
@@ -255,8 +255,8 @@ type ignoreCacheProbe struct {
 // ignoreCacheProbes returns a probe for every entry in the cache.
 func ignoreCacheProbes(c IgnoreCache) []ignoreCacheProbe {
 	var probes []ignoreCacheProbe
-	for directory, names := range c {
-		for key := range names {
+	for directory, shard := range c {
+		for key := range shard.entries {
 			path := key.name
 			if directory != "" {
 				path = directory + "/" + key.name

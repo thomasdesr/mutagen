@@ -8,7 +8,7 @@ import (
 )
 
 // ScanCache is the in-memory representation of a Cache. It shards entries by
-// directory (map[directory]map[name]*ScanCacheEntry) so that repeated
+// directory (one scanCacheShard per directory) so that repeated
 // directory-prefix strings across a large tree are stored once instead of
 // once per file, and stores modification time as inline seconds/nanoseconds
 // instead of a heap-allocated *timestamppb.Timestamp. It is never persisted
@@ -19,9 +19,27 @@ import (
 // nil *ScanCache is a valid, empty cache and all methods are nil-receiver
 // safe.
 type ScanCache struct {
-	// directories maps directory path to the entries directly within it,
-	// keyed by base name.
-	directories map[string]map[string]*ScanCacheEntry
+	// directories maps directory path to the shard of entries directly
+	// within it.
+	directories map[string]*scanCacheShard
+}
+
+// scanCacheShard holds the cache entries directly within one directory,
+// keyed by base name. Shards are boxed (rather than stored as bare maps) so
+// that a CacheInterner can hold them weakly and identical shards can be
+// shared across caches, generations, and endpoints. A shard is immutable
+// once its owning cache is published, exactly as the cache itself is.
+type scanCacheShard struct {
+	// entries maps base name to cache entry.
+	entries map[string]*ScanCacheEntry
+	// internHash is the shard's content hash, valid only when interned is
+	// true. It is written only by CacheInterner.canonicalize, before the
+	// shard is ever shared, so post-publication reads are safe.
+	internHash uint64
+	// interned indicates that this shard is the canonical instance recorded
+	// by a CacheInterner, allowing repeat introductions to short-circuit.
+	// Its write-safety argument matches internHash's.
+	interned bool
 }
 
 // ScanCacheEntry is the in-memory representation of a CacheEntry.
@@ -70,7 +88,7 @@ func NewScanCacheFromProto(cache *Cache) *ScanCache {
 // capacity pre-allocated. The returned cache is always non-nil, unlike a
 // bare zero-value ScanCache, so it's safe to call set on it immediately.
 func newScanCache(directoryCapacityHint int) *ScanCache {
-	return &ScanCache{directories: make(map[string]map[string]*ScanCacheEntry, directoryCapacityHint)}
+	return &ScanCache{directories: make(map[string]*scanCacheShard, directoryCapacityHint)}
 }
 
 // Proto converts a ScanCache into a wire-format Cache.
@@ -79,8 +97,8 @@ func (c *ScanCache) Proto() *Cache {
 	if c == nil {
 		return result
 	}
-	for directory, names := range c.directories {
-		for name, entry := range names {
+	for directory, shard := range c.directories {
+		for name, entry := range shard.entries {
 			path := name
 			if directory != "" {
 				path = directory + "/" + name
@@ -106,18 +124,22 @@ func (c *ScanCache) get(path string) *ScanCacheEntry {
 		return nil
 	}
 	directory, name := splitCachePath(path)
-	return c.directories[directory][name]
+	shard := c.directories[directory]
+	if shard == nil {
+		return nil
+	}
+	return shard.entries[name]
 }
 
 // set stores the entry for the file named name within directory. It
-// allocates the inner per-directory map on first use.
+// allocates the per-directory shard on first use.
 func (c *ScanCache) set(directory, name string, entry *ScanCacheEntry) {
-	names := c.directories[directory]
-	if names == nil {
-		names = make(map[string]*ScanCacheEntry)
-		c.directories[directory] = names
+	shard := c.directories[directory]
+	if shard == nil {
+		shard = &scanCacheShard{entries: make(map[string]*ScanCacheEntry)}
+		c.directories[directory] = shard
 	}
-	names[name] = entry
+	shard.entries[name] = entry
 }
 
 // len returns the total number of entries in the cache.
@@ -126,8 +148,8 @@ func (c *ScanCache) len() int {
 		return 0
 	}
 	var total int
-	for _, names := range c.directories {
-		total += len(names)
+	for _, shard := range c.directories {
+		total += len(shard.entries)
 	}
 	return total
 }
@@ -152,11 +174,17 @@ func (c *ScanCache) Equal(other *ScanCache) bool {
 		return false
 	}
 
-	// Check contents.
-	for directory, names := range c.directories {
-		otherNames := other.directories[directory]
-		for name, entry := range names {
-			otherEntry := otherNames[name]
+	// Check contents. Shards shared by pointer (via interning) are equal by
+	// construction.
+	for directory, shard := range c.directories {
+		otherShard := other.directories[directory]
+		if otherShard == nil {
+			return false
+		} else if otherShard == shard {
+			continue
+		}
+		for name, entry := range shard.entries {
+			otherEntry := otherShard.entries[name]
 			if otherEntry == nil {
 				return false
 			}
@@ -192,8 +220,8 @@ func (c *ScanCache) GenerateReverseLookupMap() (*ReverseLookupMap, error) {
 	digestSize := -1
 
 	// Loop over entries.
-	for directory, names := range c.directories {
-		for name, entry := range names {
+	for directory, shard := range c.directories {
+		for name, entry := range shard.entries {
 			path := name
 			if directory != "" {
 				path = directory + "/" + name

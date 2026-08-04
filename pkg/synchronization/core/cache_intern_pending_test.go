@@ -1,11 +1,6 @@
-//go:build wiring_pending
-
-// This file holds the RED contracts for cache interning: canonicalizing the
+// This file holds the contracts for cache interning: canonicalizing the
 // per-directory shards of ScanCache and IgnoreCache against one daemon-wide
-// weak table, the way Interner canonicalizes Entry subtrees. It is build-tagged
-// so that the branch stays green; run it with
-//
-//	go test -tags wiring_pending -race -run Pending ./pkg/synchronization/core/
+// weak table, the way Interner canonicalizes Entry subtrees.
 //
 // The motivation is measured: two sessions watching the same local directory run
 // two local endpoints that each build an identical ScanCache and IgnoreCache

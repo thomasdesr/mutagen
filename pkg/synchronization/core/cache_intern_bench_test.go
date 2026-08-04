@@ -1,10 +1,7 @@
-//go:build wiring_pending
-
-// This file holds the retained-memory measurement for cache interning. It is
-// build-tagged alongside the contracts in cache_intern_pending_test.go because
-// it references the same not-yet-existing API; run it with
+// This file holds the retained-memory measurement for cache interning; run it
+// with
 //
-//	go test -tags wiring_pending ./pkg/synchronization/core/ -run '^$' \
+//	go test ./pkg/synchronization/core/ -run '^$' \
 //	    -bench BenchmarkCacheInterningRetention -benchtime=1x
 package core
 

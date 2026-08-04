@@ -595,11 +595,13 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 		c.flushRequests = nil
 		c.done = nil
 
-		// The loop's trees just became unreachable, and a halted session
-		// inserts nothing more into the shared interning table, so its
-		// insertion-scheduled sweep won't run on its own. Sweep explicitly on
-		// this signal to drop the table's records of the session's subtrees.
+		// The loop's trees and caches just became unreachable, and a halted
+		// session inserts nothing more into the shared interning tables, so
+		// their insertion-scheduled sweeps won't run on their own. Sweep
+		// explicitly on this signal to drop the tables' records of the
+		// session's subtrees and cache shards.
 		core.SharedInterner().Sweep()
+		core.SharedCacheInterner().Sweep()
 	}
 
 	// Handle based on the halt mode.

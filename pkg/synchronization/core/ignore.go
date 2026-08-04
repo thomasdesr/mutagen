@@ -160,10 +160,28 @@ func (i *ignorer) ignored(path string, directory bool) bool {
 }
 
 // IgnoreCache provides an efficient mechanism to avoid recomputing ignores.
-// It shards entries by directory (map[directory]map[name+directory-ness])
-// so that repeated directory-prefix strings across a large tree are stored
-// once instead of once per checked path.
-type IgnoreCache map[string]map[ignoreCacheEntryKey]bool
+// It shards entries by directory (one ignoreCacheShard per directory) so
+// that repeated directory-prefix strings across a large tree are stored once
+// instead of once per checked path.
+type IgnoreCache map[string]*ignoreCacheShard
+
+// ignoreCacheShard holds the ignore determinations for the paths directly
+// within one directory. Shards are boxed (rather than stored as bare maps)
+// so that a CacheInterner can hold them weakly and identical shards can be
+// shared across caches, generations, and endpoints. A shard is immutable
+// once its owning cache is published, exactly as the cache itself is.
+type ignoreCacheShard struct {
+	// entries maps within-directory keys to ignore determinations.
+	entries map[ignoreCacheEntryKey]bool
+	// internHash is the shard's content hash, valid only when interned is
+	// true. It is written only by CacheInterner.canonicalize, before the
+	// shard is ever shared, so post-publication reads are safe.
+	internHash uint64
+	// interned indicates that this shard is the canonical instance recorded
+	// by a CacheInterner, allowing repeat introductions to short-circuit.
+	// Its write-safety argument matches internHash's.
+	interned bool
+}
 
 // ignoreCacheEntryKey represents the within-directory portion of a key in an
 // IgnoreCache.
@@ -178,7 +196,11 @@ type ignoreCacheEntryKey struct {
 // returning ok as false if there's no cached answer.
 func (c IgnoreCache) get(path string, directory bool) (ignored, ok bool) {
 	dir, name := splitCachePath(path)
-	ignored, ok = c[dir][ignoreCacheEntryKey{name, directory}]
+	shard := c[dir]
+	if shard == nil {
+		return false, false
+	}
+	ignored, ok = shard.entries[ignoreCacheEntryKey{name, directory}]
 	return
 }
 
@@ -186,19 +208,19 @@ func (c IgnoreCache) get(path string, directory bool) (ignored, ok bool) {
 // receiver must be non-nil.
 func (c IgnoreCache) set(path string, directory bool, ignored bool) {
 	dir, name := splitCachePath(path)
-	names := c[dir]
-	if names == nil {
-		names = make(map[ignoreCacheEntryKey]bool)
-		c[dir] = names
+	shard := c[dir]
+	if shard == nil {
+		shard = &ignoreCacheShard{entries: make(map[ignoreCacheEntryKey]bool)}
+		c[dir] = shard
 	}
-	names[ignoreCacheEntryKey{name, directory}] = ignored
+	shard.entries[ignoreCacheEntryKey{name, directory}] = ignored
 }
 
 // Len returns the total number of entries in the cache.
 func (c IgnoreCache) Len() int {
 	var total int
-	for _, names := range c {
-		total += len(names)
+	for _, shard := range c {
+		total += len(shard.entries)
 	}
 	return total
 }
@@ -209,10 +231,15 @@ func (c IgnoreCache) Equal(other IgnoreCache) bool {
 	if c.Len() != other.Len() {
 		return false
 	}
-	for directory, names := range c {
-		otherNames := other[directory]
-		for key, value := range names {
-			if otherValue, ok := otherNames[key]; !ok || otherValue != value {
+	for directory, shard := range c {
+		otherShard := other[directory]
+		if otherShard == nil {
+			return false
+		} else if otherShard == shard {
+			continue
+		}
+		for key, value := range shard.entries {
+			if otherValue, ok := otherShard.entries[key]; !ok || otherValue != value {
 				return false
 			}
 		}
@@ -224,12 +251,14 @@ func (c IgnoreCache) Equal(other IgnoreCache) bool {
 // receiver) is a subset of original, excluding the presence of a root path
 // key in the accelerated case.
 func (accelerated IgnoreCache) AcceleratedSubsetOf(original IgnoreCache) bool {
-	for directory, names := range accelerated {
-		originalNames := original[directory]
-		for key, value := range names {
+	for directory, shard := range accelerated {
+		originalShard := original[directory]
+		for key, value := range shard.entries {
 			if directory == "" && key.name == "" {
 				continue
-			} else if otherValue, ok := originalNames[key]; !ok || otherValue != value {
+			} else if originalShard == nil {
+				return false
+			} else if otherValue, ok := originalShard.entries[key]; !ok || otherValue != value {
 				return false
 			}
 		}
@@ -240,18 +269,24 @@ func (accelerated IgnoreCache) AcceleratedSubsetOf(original IgnoreCache) bool {
 // IntersectionEqual verifies that two ignore caches agree on every key
 // present in both of them, ignoring keys present in only one.
 func (c IgnoreCache) IntersectionEqual(other IgnoreCache) bool {
-	for directory, names := range c {
-		otherNames := other[directory]
-		for key, value := range names {
-			if otherValue, ok := otherNames[key]; ok && otherValue != value {
+	for directory, shard := range c {
+		otherShard := other[directory]
+		if otherShard == nil {
+			continue
+		}
+		for key, value := range shard.entries {
+			if otherValue, ok := otherShard.entries[key]; ok && otherValue != value {
 				return false
 			}
 		}
 	}
-	for directory, names := range other {
-		cNames := c[directory]
-		for key, value := range names {
-			if cValue, ok := cNames[key]; ok && cValue != value {
+	for directory, shard := range other {
+		cShard := c[directory]
+		if cShard == nil {
+			continue
+		}
+		for key, value := range shard.entries {
+			if cValue, ok := cShard.entries[key]; ok && cValue != value {
 				return false
 			}
 		}

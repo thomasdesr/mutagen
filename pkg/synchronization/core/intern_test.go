@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime"
+	"sync"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // TestInternCollapsesExactlyEqualSubtrees verifies the safety property that the
@@ -271,4 +274,67 @@ func randomTree(random *rand.Rand, depth int) *Entry {
 		return &Entry{Kind: EntryKind_Directory}
 	}
 	return &Entry{Kind: EntryKind_Directory, Contents: contents}
+}
+
+// TestInternConcurrentUse exercises the two forms of concurrency that a
+// daemon-wide intern table introduces: several sessions interning trees against
+// one table at the same time, and several sessions serializing a tree whose nodes
+// they now share. The latter matters because Entry is a protobuf message carrying
+// lazily-initialized internal state, so concurrent marshaling of one shared
+// message has to be safe for cross-session sharing to be safe. Run under -race.
+func TestInternConcurrentUse(t *testing.T) {
+	spec := syntheticTreeSpec{files: 3000, directoryFanout: 4, filesPerDirectory: 8, duplicateContentFraction: 0.25}
+	tree := buildSyntheticTree(spec)
+	encoded, err := proto.Marshal(&Snapshot{Content: tree})
+	if err != nil {
+		t.Fatalf("unable to marshal snapshot: %v", err)
+	}
+
+	// Intern concurrently from several goroutines, then confirm they converged on
+	// one object graph.
+	interner := &Interner{}
+	const workers = 8
+	interned := make([]*Entry, workers)
+	var group sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			snapshot := &Snapshot{}
+			if err := proto.Unmarshal(encoded, snapshot); err != nil {
+				t.Errorf("worker %d: unable to unmarshal: %v", i, err)
+				return
+			}
+			interned[i] = interner.Intern(snapshot.Content)
+		}(i)
+	}
+	group.Wait()
+	if t.Failed() {
+		return
+	}
+
+	for i := 1; i < workers; i++ {
+		if interned[i] != interned[0] {
+			t.Fatalf("worker %d did not converge on the same canonical tree as worker 0", i)
+		}
+	}
+
+	// Marshal and walk the now-shared tree from several goroutines at once.
+	shared := interned[0]
+	for i := 0; i < workers; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if _, err := proto.Marshal(&Snapshot{Content: shared}); err != nil {
+				t.Errorf("unable to marshal shared tree: %v", err)
+			}
+			if shared.Count() == 0 {
+				t.Error("shared tree counted zero entries")
+			}
+			if err := shared.EnsureValid(false); err != nil {
+				t.Errorf("shared tree is invalid: %v", err)
+			}
+		}()
+	}
+	group.Wait()
 }

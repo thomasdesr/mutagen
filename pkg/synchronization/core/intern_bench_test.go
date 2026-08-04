@@ -90,15 +90,24 @@ func BenchmarkInternEntries(b *testing.B) {
 	// Build the synthetic tree.
 	tree := buildSyntheticTree(syntheticTreeFileCount)
 
-	// Report allocations, since the intern table is transient garbage.
-	b.ReportAllocs()
+	// Benchmark with and without a table capacity hint, since callers that know
+	// the expected digest count avoid repeated growth of the table.
+	for _, hint := range []struct {
+		name  string
+		value int
+	}{
+		{"NoCapacityHint", 0},
+		{"CapacityHint", tree.distinctDigests},
+	} {
+		b.Run(hint.name, func(b *testing.B) {
+			// Report allocations, since the intern table is transient garbage.
+			b.ReportAllocs()
 
-	// Reset the benchmark timer to exclude the setup time.
-	b.ResetTimer()
-
-	// Perform the benchmark.
-	for i := 0; i < b.N; i++ {
-		NewDigestInterner(0).InternEntries(tree.root)
+			// Perform the benchmark.
+			for i := 0; i < b.N; i++ {
+				NewDigestInterner(hint.value).InternEntries(tree.root)
+			}
+		})
 	}
 }
 

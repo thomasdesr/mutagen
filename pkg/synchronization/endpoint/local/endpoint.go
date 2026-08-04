@@ -343,6 +343,13 @@ func NewEndpoint(
 		cache = &core.Cache{}
 	} else if cache.EnsureValid() != nil {
 		cache = &core.Cache{}
+	} else {
+		// Deduplicate the decoded digests. Decoding allocates a separate digest
+		// for each entry, and the digests of unmodified files are carried
+		// forward into every subsequent cache and scan result, so collapsing
+		// duplicate content is worth a pass over a cache that we still
+		// exclusively own.
+		core.NewDigestInterner(len(cache.Entries)).InternCache(cache)
 	}
 
 	// Check if this endpoint is running inside a sidecar container and, if so,

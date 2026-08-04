@@ -34,6 +34,10 @@ type endpointClient struct {
 	// lastSnapshotBytes is the serialized form of the last snapshot received
 	// from the remote endpoint.
 	lastSnapshotBytes []byte
+	// lastDistinctDigests is the number of distinct digests seen while interning
+	// the last snapshot received from the remote endpoint. It sizes the next
+	// snapshot's intern table.
+	lastDistinctDigests int
 }
 
 // NewEndpoint creates a new remote synchronization.Endpoint operating over the
@@ -344,6 +348,18 @@ func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bo
 	if err := proto.Unmarshal(snapshotBytes, snapshot); err != nil {
 		return nil, fmt.Errorf("unable to unmarshal snapshot: %w", err), false
 	}
+
+	// Deduplicate the snapshot's digests against those of the ancestor. Decoding
+	// allocates a separate digest for every file entry and, at steady state,
+	// nearly all of them duplicate a digest that the ancestor already holds, so
+	// this collapses a full copy of the session's digests. Only the freshly
+	// decoded snapshot, which this client exclusively owns, is modified: the
+	// ancestor is read to seed the intern table because the caller can observe
+	// its entries.
+	interner := core.NewDigestInterner(c.lastDistinctDigests)
+	interner.SeedFromEntries(ancestor)
+	interner.InternEntries(snapshot.Content)
+	c.lastDistinctDigests = interner.Len()
 
 	// Ensure that the snapshot is valid since it came over the network. Ideally
 	// we'd want this validation to be performed by the ensureValid method of

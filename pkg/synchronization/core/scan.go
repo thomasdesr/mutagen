@@ -115,6 +115,9 @@ type scanner struct {
 	newCache *Cache
 	// newIgnoreCache is the new ignored path behavior cache to populate.
 	newIgnoreCache IgnoreCache
+	// interner deduplicates the digests recorded in newly created entries and
+	// cache entries. It lives only for the duration of the scan.
+	interner *DigestInterner
 	// copyBuffer is the copy buffer used for computing file digests.
 	copyBuffer []byte
 	// deviceID is the device ID of the synchronization root filesystem.
@@ -223,6 +226,14 @@ func (s *scanner) file(
 		// Compute the digest.
 		digest = s.hasher.Sum(nil)
 	}
+
+	// Deduplicate the digest against the digests seen so far in this scan so
+	// that files with identical content share a single backing array. Interning
+	// happens here, as each entry is created, rather than over the finished
+	// snapshot, because accelerated scans splice unmodified subtrees of the
+	// baseline snapshot into their result and those entries are observable by
+	// other Goroutines.
+	digest = s.interner.Intern(digest)
 
 	// Add an entry to the new cache.
 	if cacheEntryReusable {
@@ -818,6 +829,7 @@ func Scan(
 		permissionsMode:        permissionsMode,
 		newCache:               newCache,
 		newIgnoreCache:         newIgnoreCache,
+		interner:               NewDigestInterner(len(cache.Entries)),
 		copyBuffer:             make([]byte, scannerCopyBufferSize),
 		deviceID:               metadata.DeviceID,
 		recomposeUnicode:       decomposesUnicode,

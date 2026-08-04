@@ -871,6 +871,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 	}
 	ancestor := archive.Content
 
+	// Deduplicate the ancestor's digests while we still exclusively own the
+	// hierarchy. Once the ancestor has been handed to an endpoint for scanning,
+	// its entries can be spliced into snapshots that other Goroutines observe.
+	core.NewDigestInterner(int(ancestor.Count())).InternEntries(ancestor)
+
 	// Compute the effective synchronization mode.
 	synchronizationMode := c.session.Configuration.SynchronizationMode
 	if synchronizationMode.IsDefault() {

@@ -112,6 +112,83 @@ biconditional property test; whether the production trees actually coincide
 as `MEMORY-EFFICIENCY.md` claims — confirmable by logging `Interner.size()`
 against summed `Count()` once wired.
 
+## Wiring test contract
+
+Tests for the daemon wiring exist ahead of the wiring. The RED ones are behind
+`//go:build wiring_pending` so the branch stays green:
+
+```
+go test -tags wiring_pending -race -run Pending ./pkg/synchronization/core/
+go test -tags wiring_pending -run Pending ./pkg/synchronization/endpoint/remote/
+```
+
+### Pinned (already true)
+
+- `TestInternConcurrentUse` — a shared table, eight goroutines decoding one
+  identical serialized snapshot, converging on one root pointer. This is the
+  cross-session collapse property; it needed no new test.
+- `TestInternDoesNotMutatePublishedTree` (new) — interning the next cycle's
+  freshly decoded tree collapses it onto the published tree **and** rewrites no
+  edge reachable from that published tree, with a reader walking it throughout.
+  This is what makes any wiring site safe against `watchPoll`. Verified
+  non-vacuous: with `canonicalize` mutated never to return an existing entry, it
+  fails.
+- `TestScanRoundTripDecodesSnapshot` (new) — a real `endpointClient` against a
+  real `ServeEndpoint` over `net.Pipe`, scanning a temporary root. Nothing is
+  stubbed, so the RED tests below inherit a transport that is exercised on every
+  untagged run.
+
+### RED (awaiting wiring)
+
+- `TestScanCollapsesRepeatedCyclesPending` — two scans of an unchanged root
+  through one client return the same root pointer. Fails: *the second cycle's
+  snapshot did not collapse onto the first cycle's*. Satisfied by any table that
+  survives across cycles.
+- `TestScanCollapsesAcrossSessionsPending` — two client/server pairs over one
+  root return the same root pointer. Fails the same way; its `Equal` assertion
+  passes first, so the premise (two sessions on one directory really do produce
+  deep-equal trees) is confirmed, not assumed. Satisfied only by a table both
+  endpoints reach.
+- `TestInternIsWriteFreeForAlreadyCanonicalTreesPending` — re-interning an
+  already-canonical tree while a reader walks it. Fails under `-race`: write at
+  `intern.go:91` (`e.Contents[name] = canonicalChild`) against a read in
+  `Entry.Count`.
+
+### Seams the implementer must create
+
+1. **Write-free interning of already-canonical subtrees.** Required by the local
+   endpoint site: an accelerated scan splices unmodified subtrees of the
+   *published* snapshot into the new one (`scan.go:503`), so the tree reaching
+   `Intern` is not exclusively owned however early the hook is placed. Guarding
+   the assignment (`if canonicalChild != child`) is sufficient and cheap — the
+   spliced nodes' children are canonical whenever the previous snapshot was
+   interned, which holds inductively once the site publishes interned trees. Do
+   not weaken the ownership doc comment instead; the race is real, not
+   theoretical.
+2. **An `Interner` reachable at each decode point.** The two remote RED tests
+   construct endpoints directly, so they pass only if the table reaches
+   `endpointClient.Scan` without being threaded through
+   `synchronization.ProtocolHandler.Connect` (`connect.go:17`, implemented by
+   `ssh`, `docker`, `local`, and the integration `netpipe` handler). A
+   package-level accessor in `core` satisfies them as written. If injection
+   through `Connect` is chosen instead, both tests must be rewritten to inject —
+   the contract is one daemon-wide table, not the mechanism.
+3. **`Sweep()` on session termination.** Already exported and tested
+   (`TestInternEvictsCollectedSubtrees`); nothing but a call site is missing.
+
+### Untested seams (need integration coverage)
+
+- **The local endpoint hook** (`endpoint/local/endpoint.go:961`, before
+  `e.snapshot = snapshot`). Reaching it needs a watcher and a scan cache, so only
+  the mechanism it depends on is covered, by seam 1's RED test.
+- **Both controller ancestor sites** (`controller.go:872`, freshly loaded from
+  the archive, and `controller.go:1364`, freshly returned by `core.Apply`). Both
+  trees are exclusively owned, so they need no new seam, but reaching them needs
+  a session archive and a running controller.
+- **Cycle-latency cost of re-interning after the `Apply` /
+  `PropagateExecutability` deep copies.** Benchmarked per tree above, never
+  measured per cycle in the daemon.
+
 ## Files
 
 - `pkg/synchronization/core/intern.go` — new: `Interner`, weak table, sweep,
@@ -122,6 +199,11 @@ against summed `Count()` once wired.
   benchmarks
 - `pkg/synchronization/core/testing_synthetic_test.go` — new: synthetic tree
   + retained-heap harness
+- `pkg/synchronization/core/intern_wiring_test.go` — new: publish-safety
+- `pkg/synchronization/core/intern_published_pending_test.go` — new, RED
+- `pkg/synchronization/endpoint/remote/scan_roundtrip_test.go` — new:
+  client/server transport harness
+- `pkg/synchronization/endpoint/remote/intern_wiring_test.go` — new, RED
 - `pkg/synchronization/core/diff.go` — pointer-equality fast path (pays off
   without interning: the accelerated scanner and `Apply` already produce
   identical-pointer subtrees)

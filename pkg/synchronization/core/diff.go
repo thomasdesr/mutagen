@@ -8,6 +8,17 @@ type differ struct {
 
 // diff is the recursive diff entry point.
 func (d *differ) diff(path string, base, target *Entry) {
+	// Identical pointers denote identical subtrees, including the case where both
+	// are nil, so there is nothing to report and nothing below worth visiting.
+	// Rejecting a whole subtree on one comparison is what makes shared subtrees
+	// cheap to diff, and it already applies without any sharing scheme: the
+	// accelerated scanner splices unchanged subtrees of the previous snapshot
+	// into the new one, and Apply returns its base unmodified when there are no
+	// changes.
+	if base == target {
+		return
+	}
+
 	// If the nodes at this path aren't equal, then do a complete replacement.
 	if !target.Equal(base, false) {
 		d.changes = append(d.changes, &Change{

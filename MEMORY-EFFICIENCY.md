@@ -193,6 +193,18 @@ its findings, not its diff.
 Revised end-state estimate: ~1.9GB → 600–900MB steady state, with cycle-peak
 allocation reduced by path-copying rather than increased by interning passes.
 
+## Phase 4 shipped and measured live (2026-08-04): 176 B/entry
+
+Cache compaction merged (directory-sharded `ScanCache`/`IgnoreCache`, inline
+mod-times, wire format unchanged; rebase onto phases 1–3 was conflict-free
+with the intern hook ordering verified by reading, not by trusting the
+replay). Live: post-GC heap **597MB / 176.0 B/entry** (3.56M entries) —
+through the 180–275 target floor, from ~575 B/entry at the start of this
+effort. Remaining heap is scan/cache state at its compacted size plus one
+snapshot tree family; further reduction would need the arena representation
+(path 5), which the target no longer justifies. Follow-ups: soak, then
+consider upstreaming path-copying + interning + the phase-1 items.
+
 ## Phases 2 and 3 shipped and measured live (2026-08-04)
 
 Path-copying `Apply`/`PropagateExecutability` (phase 2) and daemon-wide

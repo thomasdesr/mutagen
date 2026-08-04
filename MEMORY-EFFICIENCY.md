@@ -193,6 +193,36 @@ its findings, not its diff.
 Revised end-state estimate: ~1.9GB → 600–900MB steady state, with cycle-peak
 allocation reduced by path-copying rather than increased by interning passes.
 
+## Phases 2 and 3 shipped and measured live (2026-08-04)
+
+Path-copying `Apply`/`PropagateExecutability` (phase 2) and daemon-wide
+subtree interning (phase 3), both developed test-first: sharing/allocation
+contracts written as failing tests before implementation, all formerly-RED
+tests now green including `-race`.
+
+**Live results, normalized:** post-GC live heap **805MB / 251.9 B/entry**
+(3.35M tracked entries) — from 498 B/entry after phase 1 and ~575 before any
+work, landing inside the 180–275 B/entry target. `Sys` 1.89GB (from 3.63GB
+originally). Attribution shifted as predicted: `Entry.Copy` vanished from the
+allocation profile (12GB cumulative in ~19h on the old binary → zero), and
+the remaining heap is dominated by scan-side state — the `Cache`/`IgnoreCache`
+family, which is phase 4.
+
+Phase 2 validation note: differential 30s windows were useless for measuring
+the Apply burst (background sync churn from parallel agent workloads runs
+~4.5GB/30s of allocation) — cumulative `alloc_space` attribution by function
+is the churn-proof method.
+
+Phase 3 wiring (all sites intern before publishing, per the seam spec):
+local endpoint post-scan, remote client post-decode, controller at ancestor
+load and post-Apply, `Sweep()` on session halt. Safety: interning writes a
+content map only when a child's identity changes (write-free over
+already-canonical subtrees), and every publish site interning keeps published
+trees canonical inductively. Full-flush cost rose ~37s→49s (intern pass over
+forced full rescans of 3.3M entries); natural accelerated cycles are
+unaffected in normal use. End-to-end propagation verified (probe file synced
+to a remote with correct contents).
+
 ## Phase 1 shipped and measured live (2026-08-04)
 
 Deployed to the real 4-session workload via the nix overlay (daemon runs the

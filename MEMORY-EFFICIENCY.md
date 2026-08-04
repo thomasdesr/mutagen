@@ -107,6 +107,14 @@ upstreamable.
   `MUTAGEN_PPROF_ADDR`. Baseline profiles are saved from 2026-08-03/04.
 - Success metric: steady-state live heap for the current four-session setup,
   target under ~700MB (from 1.9GB), with no regression in cycle latency.
+- **Metric convention (2026-08-04):** the workload's tree sizes drift (other
+  agents add and remove worktrees continuously), so every live measurement
+  captures post-GC heap (`?gc=1`) and the session entry counts in the same
+  breath and reports **bytes per tracked endpoint entry** (Σ over sessions ×
+  endpoints of files+dirs+symlinks). Baselines: pre-phase-1 ≈ 575 B/entry;
+  post-phase-1 = 498 B/entry (1.63GB / 3.27M); end-state target ≈ 180–275
+  B/entry. Priorities: retained (post-GC) bytes first, peak `Sys`/RSS second;
+  allocation counts and GC CPU matter only through those two.
 
 ## Sequencing (superseded — see below)
 

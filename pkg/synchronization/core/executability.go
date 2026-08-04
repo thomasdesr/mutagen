@@ -4,13 +4,37 @@ import (
 	"bytes"
 )
 
-// propagateExecutabilityRecursive propagates executability recursively.
-func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
+// PropagateExecutability propagates file executability from the ancestor and
+// source to the target in a recursive fashion. Executability information is
+// only propagated if entry paths, types, and contents match, with source taking
+// precedent over ancestor. The returned entry shares unmodified subtrees with
+// the target by pointer, relying on the immutability of Entry objects: only
+// the nodes along the paths of actual propagations (plus the root) are freshly
+// allocated, so the cost scales with the propagated changes, not the tree.
+func PropagateExecutability(ancestor, source, target *Entry) *Entry {
+	// Perform propagation.
+	result := propagateExecutabilityRecursive(ancestor, source, target)
+
+	// Callers receive a root object distinct from the target, even when no
+	// propagation occurred. This costs one node and one contents map.
+	if result == target && target != nil {
+		result = shallowCopyEntry(target)
+	}
+
+	// Done.
+	return result
+}
+
+// propagateExecutabilityRecursive propagates executability recursively. It
+// returns the target if no propagation occurred beneath it, or a freshly
+// allocated replacement node (sharing unmodified children with the target by
+// pointer) if any did. It never mutates the target.
+func propagateExecutabilityRecursive(ancestor, source, target *Entry) *Entry {
 	// If there is no location from which executability information can be
 	// propagated or no location to which executability information can be
 	// propagated, then we can discontinue recursion along this path.
 	if (ancestor == nil && source == nil) || target == nil {
-		return
+		return target
 	}
 
 	// Handle based on target kind.
@@ -26,14 +50,26 @@ func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
 		// levels. The same is true of target is empty, but that's implicitly
 		// checked below since that's what we loop over.
 		if len(sourceContents) == 0 && len(ancestorContents) == 0 {
-			return
+			return target
 		}
 
 		// Loop over the target contents and recursively propagate
-		// executability.
-		for name := range targetContents {
-			propagateExecutabilityRecursive(ancestorContents[name], sourceContents[name], targetContents[name])
+		// executability, copying this node only if some child actually
+		// changed.
+		var copied *Entry
+		for name, child := range targetContents {
+			newChild := propagateExecutabilityRecursive(ancestorContents[name], sourceContents[name], child)
+			if newChild != child {
+				if copied == nil {
+					copied = shallowCopyEntry(target)
+				}
+				copied.Contents[name] = newChild
+			}
 		}
+		if copied != nil {
+			return copied
+		}
+		return target
 	} else if target.Kind == EntryKind_File {
 		// If this is a file, then we use a series of heuristics to perform the
 		// correct propagation.
@@ -65,8 +101,7 @@ func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
 		propagateFromSource := source != nil && source.Kind == EntryKind_File &&
 			bytes.Equal(source.Digest, target.Digest)
 		if propagateFromSource {
-			target.Executable = source.Executable
-			return
+			return fileWithExecutability(target, source.Executable)
 		}
 
 		// If the source and target differ, then we look to the ancestor. If the
@@ -80,8 +115,7 @@ func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
 		propagateFromAncestor := ancestor != nil && ancestor.Kind == EntryKind_File &&
 			bytes.Equal(ancestor.Digest, target.Digest)
 		if propagateFromAncestor {
-			target.Executable = ancestor.Executable
-			return
+			return fileWithExecutability(target, ancestor.Executable)
 		}
 
 		// If the target contents differ from both the ancestor and the source,
@@ -106,8 +140,7 @@ func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
 			source.Kind == EntryKind_File && ancestor.Kind == EntryKind_File &&
 			bytes.Equal(source.Digest, ancestor.Digest)
 		if propagateFromSource {
-			target.Executable = source.Executable
-			return
+			return fileWithExecutability(target, source.Executable)
 		}
 
 		// We intentially avoid propagating executability bits in the case that
@@ -115,19 +148,37 @@ func propagateExecutabilityRecursive(ancestor, source, target *Entry) {
 		// contents. There is no heuristic that consistently makes sense for
 		// even a small fraction of such cases.
 	}
+
+	// No propagation occurred.
+	return target
 }
 
-// PropagateExecutability propagates file executability from the ancestor and
-// source to the target in a recursive fashion. Executability information is
-// only propagated if entry paths, types, and contents match, with source taking
-// precedent over ancestor.
-func PropagateExecutability(ancestor, source, target *Entry) *Entry {
-	// Create a copy of the snapshot that we can mutate.
-	result := target.Copy(true)
+// fileWithExecutability returns the target if its executability already
+// matches, or a freshly allocated copy with the specified executability.
+func fileWithExecutability(target *Entry, executable bool) *Entry {
+	if target.Executable == executable {
+		return target
+	}
+	result := shallowCopyEntry(target)
+	result.Executable = executable
+	return result
+}
 
-	// Perform propagation.
-	propagateExecutabilityRecursive(ancestor, source, result)
-
-	// Done.
+// shallowCopyEntry creates a copy of an entry whose contents map (if any) is
+// freshly allocated but shares the children by pointer.
+func shallowCopyEntry(entry *Entry) *Entry {
+	result := &Entry{
+		Kind:       entry.Kind,
+		Digest:     entry.Digest,
+		Executable: entry.Executable,
+		Target:     entry.Target,
+		Problem:    entry.Problem,
+	}
+	if entry.Contents != nil {
+		result.Contents = make(map[string]*Entry, len(entry.Contents))
+		for name, child := range entry.Contents {
+			result.Contents[name] = child
+		}
+	}
 	return result
 }

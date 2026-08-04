@@ -26,12 +26,18 @@ import (
 )
 
 // NewDecompressor creates a new Zstandard decompressor that reads from the
-// specified stream with a default configuration.
+// specified stream. Decoding is single-goroutine with low-memory buffering:
+// these decompressors live on session control streams, sit mostly idle, and
+// retain their state for the life of the connection, so per-stream state
+// matters more than throughput.
 func NewDecompressor(compressed io.Reader) io.ReadCloser {
 	// Create the decompressor. We check for errors, but we don't include them
 	// as part of the interface because they can only occur with an invalid
-	// decompressor configuration (which can't occur when we only use defaults).
-	decompressor, err := zstd.NewReader(compressed)
+	// decompressor configuration (which can't occur with these fixed options).
+	decompressor, err := zstd.NewReader(compressed,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true),
+	)
 	if err != nil {
 		panic("Zstandard decompressor construction failed")
 	}
@@ -40,13 +46,22 @@ func NewDecompressor(compressed io.Reader) io.ReadCloser {
 	return decompressor.IOReadCloser()
 }
 
-// NewCompressor creates a new Zstandard compressor that writes to the specified
-// stream with a default configuration.
+// NewCompressor creates a new Zstandard compressor that writes to the
+// specified stream. Encoding is single-goroutine with a 1 MiB window rather
+// than the default GOMAXPROCS-wide encoder state and 8 MiB window: these
+// compressors live on session control streams, sit mostly idle, and retain
+// their state for the life of the connection, so per-stream state matters
+// more than throughput. The smaller window costs some compression ratio on
+// large transfers (initial snapshots); steady-state deltas are far smaller
+// than the window either way.
 func NewCompressor(compressed io.Writer) stream.WriteFlushCloser {
 	// Create the compressor. We check for errors, but we don't include them as
 	// part of the interface because they can only occur with an invalid
-	// compressor configuration (which can't occur when we only use defaults).
-	compressor, err := zstd.NewWriter(compressed)
+	// compressor configuration (which can't occur with these fixed options).
+	compressor, err := zstd.NewWriter(compressed,
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithWindowSize(1<<20),
+	)
 	if err != nil {
 		panic("Zstandard compressor construction failed")
 	}

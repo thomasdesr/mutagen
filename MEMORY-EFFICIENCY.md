@@ -184,3 +184,25 @@ its findings, not its diff.
 
 Revised end-state estimate: ~1.9GB → 600–900MB steady state, with cycle-peak
 allocation reduced by path-copying rather than increased by interning passes.
+
+## Phase 1 shipped and measured live (2026-08-04)
+
+Deployed to the real 4-session workload via the nix overlay (daemon runs the
+fork). Post-GC live heap **1.51GB, Sys 2.46GB** — down from ~1.9GB live /
+3.63GB Sys before phase 1. Site-level confirmation: `bytes.growSlice`
+(the retained rsync baselines) eliminated from the profile; zstd stream state
+down to ~36MB of decoder buffers. A forced flush of all four sessions
+completes cleanly through the new baseline path.
+
+**Retention lesson learned the measured way:** the first attempt retained the
+*decoded* last snapshot on the claim that the controller already holds it.
+Wrong — the controller's per-cycle snapshot variables die between iterations;
+only the *ancestor* persists (controller.go:872). Retaining the decoded tree
+regressed live heap ~200MB (caught post-GC). The shipped design retains
+nothing: the baseline is re-marshaled from the ancestor each Scan, costing a
+transient marshal buffer per cycle and at most one cycle's delta efficiency.
+This also corrects the independent attribution's "three retained tree copies
+per session": between cycles a remote-endpoint session retains the ancestor
+and the local endpoint's snapshot; the decoded remote snapshot is transient.
+Structural-sharing math should count coexisting trees accordingly (the
+cross-session and ancestor/alpha sharing wins stand).

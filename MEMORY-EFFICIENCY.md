@@ -43,6 +43,9 @@ never exploited.
 Upstream `master`/`v019-development` contain no overlapping work in
 `pkg/synchronization/core` (proto regens, Go version bump, ignore semantics).
 
+> **2026-08-04:** The ranking below has been tested. See "Measured results and
+> revised plan" at the end of this document — it supersedes the estimates here.
+
 ## Proposed paths, ranked by expected value
 
 ### 1. Digest interning / inlining (highest certainty)
@@ -105,7 +108,79 @@ upstreamable.
 - Success metric: steady-state live heap for the current four-session setup,
   target under ~700MB (from 1.9GB), with no regression in cycle latency.
 
-## Sequencing
+## Sequencing (superseded — see below)
 
 1 → 2 → 3 in separate commits, measuring after each; 4 folded in where it
 makes 1–2 cheaper at peak; 5 only on evidence that 1–3 plateau above target.
+
+## Measured results and revised plan (2026-08-04)
+
+Four parallel investigations: three prototype branches plus an independent,
+unanchored attribution pass (`explore/independent`, done without reading this
+document — it converged on the same two dominant structures and found three
+things this document missed).
+
+### What each track measured
+
+**Structural sharing (`me/structural-sharing`) — confirmed, the main event.**
+Six identical decoded copies of a 162k-entry tree: 186MB baseline → 27.8MB
+interned (6.7×), flat in the number of copies. Immutability audit CLEAR — all
+nine Entry-mutation sites write only to freshly-copied trees, and mutagen
+already pointer-shares subtrees in production (scanner baseline splicing).
+Intern pass costs about one proto-decode per tree; diff of shared identical
+trees drops from 8.3ms to 16ns via a pointer-equality fast path (committed;
+pays off even without interning). Not yet wired into the daemon.
+
+**Digest interning (`me/digest-interning`) — demoted, estimate corrected.**
+This document's 200–300MB estimate was wrong: digest bytes total only ~72MB
+of heap; interning's honest ceiling is ~24MB / 1.5M objects (~7% of live
+objects, ~1.3% of bytes). Prototype works and is measured to ±2 objects, but
+ships only if the GC-pressure win justifies it; digest *inlining* (part of a
+compact representation) is worth ~2× interning and subsumes it. Critical side
+finding: `endpoint.watchPoll` reads the published snapshot after releasing
+`scanLock`, and the scanner splices published subtrees into new snapshots —
+so no pass may rewrite trees it doesn't exclusively own. This constrains
+where the subtree interner can hook in (producer-owned sites only).
+
+**Cache compaction (`me/cache-compaction`) — confirmed, threshold resolved.**
+Directory-sharded maps + inline mod-times: −66% bytes/file at fan-out 8,
+regression below fan-out ~4. The real 630k-file tree has mean fan-out 8.7,
+and the 52% of directories below the threshold hold only 13% of files —
+clear aggregate win on the cache family (~430MB of heap per the independent
+attribution). Wire format unchanged.
+
+**Independent attribution (`explore/independent`) — three new needles.**
+(1) `lastSnapshotBytes`: each remote endpoint client retains the serialized
+snapshot as an rsync baseline — ~144MB of pure redundancy, regenerable on
+demand because both sides already marshal deterministically. (2) zstd stream
+state on idle connections: ~85–90MB, fixable with encoder-concurrency /
+window-size options. (3) `core.Apply` deep-copies the entire ancestor for any
+non-empty change list — a ~163MB allocation burst per changed file per
+monorepo session, independently flagged by the sharing track
+(`PropagateExecutability` too), and the explanation for RSS peaks well above
+live heap.
+
+### Revised sequence
+
+1. **Trivial wins (~230MB, no structural risk):** drop `lastSnapshotBytes`
+   (regenerate on demand), configure zstd streams. Analysis-only so far — 
+   needs implementation.
+2. **Path-copying `Apply` and `PropagateExecutability`:** kills the per-cycle
+   full-tree copy bursts on its own merits, and is the precondition for
+   sharing to survive across cycles.
+3. **Wire the subtree interner** at producer-owned hook points (respecting
+   the watchPoll ownership constraint), with `Interner.size()` telemetry to
+   confirm the production trees actually coincide. Expected: the dominant
+   share of the ~1.28GB tree memory.
+4. **Cache compaction** (`me/cache-compaction` merge).
+5. **Live A/B after each step** via the nix overlay + pprof + GOMEMLIMIT
+   harness; the digest branch's findings file contains the peak-vs-limit
+   experiment design.
+
+Integration note: `me/digest-interning` and `me/structural-sharing` both
+added `pkg/synchronization/core/intern.go` and overlapping bench harnesses —
+they conflict textually and the digest one is likely not merged anyway; mine
+its findings, not its diff.
+
+Revised end-state estimate: ~1.9GB → 600–900MB steady state, with cycle-peak
+allocation reduced by path-copying rather than increased by interning passes.

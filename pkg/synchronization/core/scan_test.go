@@ -15,51 +15,16 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/filesystem/behavior"
 )
 
-// testingIgnoreCachesEqual verifies that two ignore caches are equal.
-func testingIgnoreCachesEqual(first, second IgnoreCache) bool {
-	// Check lengths.
-	if len(first) != len(second) {
-		return false
-	}
-
-	// Check contents.
-	for key, f := range first {
-		if s, ok := second[key]; !ok || s != f {
-			return false
-		}
-	}
-
-	// Done.
-	return true
-}
-
-// testingAcceleratedIgnoreCacheIsSubset verifies that an accelerated ignore
-// cache is a subset of original, excluding the presence of a root path key in
-// the accelerated case.
-func testingAcceleratedIgnoreCacheIsSubset(accelerated, original IgnoreCache) bool {
-	// Check values.
-	for key, value := range accelerated {
-		if key.path == "" {
-			continue
-		} else if other, ok := original[key]; !ok || other != value {
-			return false
-		}
-	}
-
-	// Success.
-	return true
-}
-
 // testingSnapshotStatistics computes the statistics fields that would be
 // expected in a snapshot.
-func testingSnapshotStatistics(entry *Entry, cache *Cache) (directoryCount, fileCount, symbolicLinkCount, totalFileSize uint64) {
+func testingSnapshotStatistics(entry *Entry, cache *ScanCache) (directoryCount, fileCount, symbolicLinkCount, totalFileSize uint64) {
 	if entry != nil {
 		entry.walk("", func(p string, e *Entry) {
 			if e.Kind == EntryKind_Directory {
 				directoryCount++
 			} else if e.Kind == EntryKind_File {
 				fileCount++
-				totalFileSize += cache.Entries[p].Size
+				totalFileSize += cache.get(p).size
 			} else if e.Kind == EntryKind_SymbolicLink {
 				symbolicLinkCount++
 			}
@@ -649,7 +614,7 @@ func TestScan(t *testing.T) {
 					test.description, filesystem.name,
 				)
 			}
-			if !testingIgnoreCachesEqual(newIgnoreCache, ignoreCache) {
+			if !newIgnoreCache.Equal(ignoreCache) {
 				t.Errorf("%s: warm scan ignore cache does not match baseline on %s filesystem",
 					test.description, filesystem.name,
 				)
@@ -721,7 +686,7 @@ func TestScan(t *testing.T) {
 					test.description, filesystem.name,
 				)
 			}
-			if !testingAcceleratedIgnoreCacheIsSubset(newIgnoreCache, ignoreCache) {
+			if !newIgnoreCache.AcceleratedSubsetOf(ignoreCache) {
 				t.Errorf("%s: accelerated scan (without re-check paths) ignore cache not a subset of baseline on %s filesystem",
 					test.description, filesystem.name,
 				)
@@ -839,7 +804,7 @@ func TestScan(t *testing.T) {
 					test.description, filesystem.name,
 				)
 			}
-			if test.modifier == nil && !testingAcceleratedIgnoreCacheIsSubset(newIgnoreCache, ignoreCache) {
+			if test.modifier == nil && !newIgnoreCache.AcceleratedSubsetOf(ignoreCache) {
 				t.Errorf("%s: accelerated scan (with re-check path(s)) ignore cache not a subset of baseline on %s filesystem",
 					test.description, filesystem.name,
 				)

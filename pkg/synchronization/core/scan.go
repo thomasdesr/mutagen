@@ -102,7 +102,7 @@ type scanner struct {
 	// hasher is the hashing function to use for computing file digests.
 	hasher hash.Hash
 	// cache is the existing cache to use for fast digest lookups.
-	cache *Cache
+	cache *ScanCache
 	// ignorer is the ignorer identifying ignored paths.
 	ignorer *ignorer
 	// ignoreCache is the cache of ignored path behavior.
@@ -112,7 +112,7 @@ type scanner struct {
 	// permissionsMode is the permissions mode being used.
 	permissionsMode PermissionsMode
 	// newCache is the new file digest cache to populate.
-	newCache *Cache
+	newCache *ScanCache
 	// newIgnoreCache is the new ignored path behavior cache to populate.
 	newIgnoreCache IgnoreCache
 	// copyBuffer is the copy buffer used for computing file digests.
@@ -156,7 +156,8 @@ func (s *scanner) file(
 	}
 
 	// Try to find cached data for this path.
-	cached, cacheHit := s.cache.Entries[path]
+	cached := s.cache.get(path)
+	cacheHit := cached != nil
 
 	// Check if we can reuse the cached digest (in order to avoid recomputation)
 	// and the cache entry itself (in order to avoid allocation). In order for
@@ -166,20 +167,26 @@ func (s *scanner) file(
 	// don't affect content, but we do check for full mode equivalence when
 	// assessing cache entry reusability since permission changes need to be
 	// detected during transition operations (where the cache is also used).
+	//
+	// The modification time comparison is equivalent to comparing
+	// metadata.ModificationTime.Equal(cached's original time.Time) because
+	// Unix seconds plus nanoseconds fully specify the instant, and it avoids
+	// reconstructing a time.Time from the cache entry's stored fields.
 	cacheContentMatch := cacheHit &&
-		(metadata.Mode&filesystem.ModeTypeMask) == (filesystem.Mode(cached.Mode)&filesystem.ModeTypeMask) &&
-		metadata.ModificationTime.Equal(cached.ModificationTime.AsTime()) &&
-		metadata.Size == cached.Size &&
-		metadata.FileID == cached.FileID
+		(metadata.Mode&filesystem.ModeTypeMask) == (filesystem.Mode(cached.mode)&filesystem.ModeTypeMask) &&
+		metadata.ModificationTime.Unix() == cached.modificationTimeSeconds &&
+		int32(metadata.ModificationTime.Nanosecond()) == cached.modificationTimeNanos &&
+		metadata.Size == cached.size &&
+		metadata.FileID == cached.fileID
 	cacheEntryReusable := cacheContentMatch &&
-		metadata.Mode == filesystem.Mode(cached.Mode)
+		metadata.Mode == filesystem.Mode(cached.mode)
 
 	// Compute the digest, either by pulling it from the cache or computing it
 	// from the on-disk contents.
 	var digest []byte
 	var err error
 	if cacheContentMatch {
-		digest = cached.Digest
+		digest = cached.digest
 	} else {
 		// If the file is not yet opened, then open it and defer its closure. We
 		// can also update the metadata at this point since we'll pay the cost
@@ -226,9 +233,14 @@ func (s *scanner) file(
 
 	// Add an entry to the new cache.
 	if cacheEntryReusable {
-		s.newCache.Entries[path] = cached
+		directory, name := splitCachePath(path)
+		s.newCache.set(directory, name, cached)
 	} else {
-		// Convert the new modification time to Protocol Buffers format.
+		// Convert the new modification time to Protocol Buffers format purely
+		// to validate it against the range Protocol Buffers can represent
+		// on-disk; this check must stay even though we store seconds/nanos
+		// directly, otherwise an out-of-range OS timestamp would silently
+		// produce an ill-formed Timestamp on the next save.
 		modificationTime := timestamppb.New(metadata.ModificationTime)
 		if err := modificationTime.CheckValid(); err != nil {
 			return &Entry{
@@ -238,13 +250,15 @@ func (s *scanner) file(
 		}
 
 		// Create the new cache entry.
-		s.newCache.Entries[path] = &CacheEntry{
-			Mode:             uint32(metadata.Mode),
-			ModificationTime: modificationTime,
-			Size:             metadata.Size,
-			FileID:           metadata.FileID,
-			Digest:           digest,
-		}
+		directory, name := splitCachePath(path)
+		s.newCache.set(directory, name, &ScanCacheEntry{
+			mode:                    uint32(metadata.Mode),
+			modificationTimeSeconds: modificationTime.Seconds,
+			modificationTimeNanos:   modificationTime.Nanos,
+			size:                    metadata.Size,
+			fileID:                  metadata.FileID,
+			digest:                  digest,
+		})
 	}
 
 	// Increment the total file count and size.
@@ -438,12 +452,11 @@ func (s *scanner) directory(
 		// Determine whether or not this path is ignored and update the new
 		// ignore cache. If the path is ignored, then record an untracked entry.
 		contentIsDirectory := contentKind == EntryKind_Directory
-		ignoreCacheKey := IgnoreCacheKey{contentPath, contentIsDirectory}
-		ignored, ok := s.ignoreCache[ignoreCacheKey]
+		ignored, ok := s.ignoreCache.get(contentPath, contentIsDirectory)
 		if !ok {
 			ignored = s.ignorer.ignored(contentPath, contentIsDirectory)
 		}
-		s.newIgnoreCache[ignoreCacheKey] = ignored
+		s.newIgnoreCache.set(contentPath, contentIsDirectory, ignored)
 		if ignored {
 			contents[contentName] = &Entry{Kind: EntryKind_Untracked}
 			continue
@@ -517,7 +530,7 @@ func (s *scanner) directory(
 					// know the directory-ness of unsynchronizable content, but
 					// heuristically it works in vast majority of cases.
 					if entry.Kind != EntryKind_Untracked && entry.Kind != EntryKind_Problematic {
-						s.newIgnoreCache[IgnoreCacheKey{path, entry.Kind == EntryKind_Directory}] = false
+						s.newIgnoreCache.set(path, entry.Kind == EntryKind_Directory, false)
 					}
 
 					// Propagate digest cache entries and update total file
@@ -527,9 +540,10 @@ func (s *scanner) directory(
 					// don't check that digests or modes match) because that
 					// would be too costly.
 					if entry.Kind == EntryKind_File {
-						if oldCacheEntry, ok := s.cache.Entries[path]; ok {
-							s.newCache.Entries[path] = oldCacheEntry
-							s.totalFileSize += oldCacheEntry.Size
+						if oldCacheEntry := s.cache.get(path); oldCacheEntry != nil {
+							directory, name := splitCachePath(path)
+							s.newCache.set(directory, name, oldCacheEntry)
+							s.totalFileSize += oldCacheEntry.size
 						} else {
 							missingCacheEntries = true
 						}
@@ -598,12 +612,12 @@ func Scan(
 	ctx context.Context,
 	root string,
 	baseline *Snapshot, recheckPaths map[string]bool,
-	hasher hash.Hash, cache *Cache,
+	hasher hash.Hash, cache *ScanCache,
 	ignores []string, ignoreCache IgnoreCache,
 	probeMode behavior.ProbeMode,
 	symbolicLinkMode SymbolicLinkMode,
 	permissionsMode PermissionsMode,
-) (*Snapshot, *Cache, IgnoreCache, error) {
+) (*Snapshot, *ScanCache, IgnoreCache, error) {
 	// Verify that the symbolic link mode is valid for this platform.
 	if symbolicLinkMode == SymbolicLinkMode_SymbolicLinkModePOSIXRaw && runtime.GOOS == "windows" {
 		return nil, nil, nil, errors.New("raw POSIX symbolic links not supported on Windows")
@@ -614,7 +628,7 @@ func Scan(
 	rootObject, metadata, err := filesystem.Open(root, false)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Snapshot{}, &Cache{}, nil, nil
+			return &Snapshot{}, newScanCache(0), nil, nil
 		} else {
 			return nil, nil, nil, fmt.Errorf("unable to open synchronization root: %w", err)
 		}
@@ -773,28 +787,23 @@ func Scan(
 		}
 	}
 
-	// If a nil cache has been provided, convert it to an empty but non-nil
-	// version to avoid needing to use the GetEntries accessor everywhere.
-	if cache == nil {
-		cache = &Cache{}
-	}
-
 	// Create the ignorer.
 	ignorer, err := newIgnorer(ignores)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("unable to create ignorer: %w", err)
 	}
 
-	// Create a new cache to populate. Estimate its capacity based on the
-	// existing cache length. If the existing cache is empty, create one with
-	// the default capacity.
+	// Create a new cache to populate. Estimate its outer (per-directory) map
+	// capacity based on the existing cache's directory count (the dimension
+	// newCache's own outer map is keyed by), not its total entry count. If
+	// the existing cache is empty or nil, use the default capacity.
 	initialCacheCapacity := defaultInitialCacheCapacity
-	if cacheLength := len(cache.Entries); cacheLength != 0 {
-		initialCacheCapacity = cacheLength
+	if cache != nil {
+		if directoryCount := len(cache.directories); directoryCount != 0 {
+			initialCacheCapacity = directoryCount
+		}
 	}
-	newCache := &Cache{
-		Entries: make(map[string]*CacheEntry, initialCacheCapacity),
-	}
+	newCache := newScanCache(initialCacheCapacity)
 
 	// Create a new ignore cache to populate. Estimate its capacity based on the
 	// existing ignore cache length. If the existing cache is empty, create one

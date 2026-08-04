@@ -159,13 +159,102 @@ func (i *ignorer) ignored(path string, directory bool) bool {
 	return ignored
 }
 
-// IgnoreCacheKey represents a key in an ignore cache.
-type IgnoreCacheKey struct {
-	// path is the path used for testing ignore status.
-	path string
+// IgnoreCache provides an efficient mechanism to avoid recomputing ignores.
+// It shards entries by directory (map[directory]map[name+directory-ness])
+// so that repeated directory-prefix strings across a large tree are stored
+// once instead of once per checked path.
+type IgnoreCache map[string]map[ignoreCacheEntryKey]bool
+
+// ignoreCacheEntryKey represents the within-directory portion of a key in an
+// IgnoreCache.
+type ignoreCacheEntryKey struct {
+	// name is the base name used for testing ignore status.
+	name string
 	// directory is whether or not that path was a directory.
 	directory bool
 }
 
-// IgnoreCache provides an efficient mechanism to avoid recomputing ignores.
-type IgnoreCache map[IgnoreCacheKey]bool
+// get looks up whether path (with the given directory-ness) is ignored,
+// returning ok as false if there's no cached answer.
+func (c IgnoreCache) get(path string, directory bool) (ignored, ok bool) {
+	dir, name := splitCachePath(path)
+	ignored, ok = c[dir][ignoreCacheEntryKey{name, directory}]
+	return
+}
+
+// set records whether path (with the given directory-ness) is ignored. The
+// receiver must be non-nil.
+func (c IgnoreCache) set(path string, directory bool, ignored bool) {
+	dir, name := splitCachePath(path)
+	names := c[dir]
+	if names == nil {
+		names = make(map[ignoreCacheEntryKey]bool)
+		c[dir] = names
+	}
+	names[ignoreCacheEntryKey{name, directory}] = ignored
+}
+
+// Len returns the total number of entries in the cache.
+func (c IgnoreCache) Len() int {
+	var total int
+	for _, names := range c {
+		total += len(names)
+	}
+	return total
+}
+
+// Equal determines whether or not another ignore cache is equal to this one.
+// It is designed specifically for tests.
+func (c IgnoreCache) Equal(other IgnoreCache) bool {
+	if c.Len() != other.Len() {
+		return false
+	}
+	for directory, names := range c {
+		otherNames := other[directory]
+		for key, value := range names {
+			if otherValue, ok := otherNames[key]; !ok || otherValue != value {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// AcceleratedSubsetOf verifies that an accelerated ignore cache (the
+// receiver) is a subset of original, excluding the presence of a root path
+// key in the accelerated case.
+func (accelerated IgnoreCache) AcceleratedSubsetOf(original IgnoreCache) bool {
+	for directory, names := range accelerated {
+		originalNames := original[directory]
+		for key, value := range names {
+			if directory == "" && key.name == "" {
+				continue
+			} else if otherValue, ok := originalNames[key]; !ok || otherValue != value {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// IntersectionEqual verifies that two ignore caches agree on every key
+// present in both of them, ignoring keys present in only one.
+func (c IgnoreCache) IntersectionEqual(other IgnoreCache) bool {
+	for directory, names := range c {
+		otherNames := other[directory]
+		for key, value := range names {
+			if otherValue, ok := otherNames[key]; ok && otherValue != value {
+				return false
+			}
+		}
+	}
+	for directory, names := range other {
+		cNames := c[directory]
+		for key, value := range names {
+			if cValue, ok := cNames[key]; ok && cValue != value {
+				return false
+			}
+		}
+	}
+	return true
+}

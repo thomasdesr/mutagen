@@ -79,6 +79,22 @@ func PathBase(path string) string {
 	return path[lastSlashIndex+1:]
 }
 
+// splitCachePath splits a root-relative synchronization path into a directory
+// and name component in a single pass, for use by directory-sharded cache
+// maps. Unlike pathDir/PathBase, it accepts the empty (root) path, returning
+// ("", "") in that case. It performs no allocations: Go string slices share
+// their backing array, so both returned strings alias path.
+func splitCachePath(path string) (directory, name string) {
+	if path == "" {
+		return "", ""
+	}
+	if lastSlashIndex := strings.LastIndexByte(path, '/'); lastSlashIndex == -1 {
+		return "", path
+	} else {
+		return path[:lastSlashIndex], path[lastSlashIndex+1:]
+	}
+}
+
 // pathLess performs a sort comparison between two root-relative synchronization
 // paths. It returns true if first comes before second in DFS traversal.
 func pathLess(first, second string) bool {

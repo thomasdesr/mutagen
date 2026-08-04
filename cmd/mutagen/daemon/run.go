@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 
@@ -57,6 +59,16 @@ func runMain(_ *cobra.Command, _ []string) error {
 		}
 	}
 	logger := logging.NewLogger(logLevel, os.Stderr)
+
+	// If requested via the environment, serve net/http/pprof diagnostics.
+	if pprofAddress := os.Getenv("MUTAGEN_PPROF_ADDR"); pprofAddress != "" {
+		go func() {
+			logger.Info("Serving pprof diagnostics on", pprofAddress)
+			if err := http.ListenAndServe(pprofAddress, nil); err != nil {
+				logger.Error("pprof server failure:", err)
+			}
+		}()
+	}
 
 	// Create a forwarding session manager and defer its shutdown.
 	forwardingManager, err := forwarding.NewManager(logger.Sublogger("forward"))

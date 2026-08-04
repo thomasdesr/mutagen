@@ -594,6 +594,12 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 		c.cancel = nil
 		c.flushRequests = nil
 		c.done = nil
+
+		// The loop's trees just became unreachable, and a halted session
+		// inserts nothing more into the shared interning table, so its
+		// insertion-scheduled sweep won't run on its own. Sweep explicitly on
+		// this signal to drop the table's records of the session's subtrees.
+		core.SharedInterner().Sweep()
 	}
 
 	// Handle based on the halt mode.
@@ -869,7 +875,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 	} else if err = archive.EnsureValid(true); err != nil {
 		return fmt.Errorf("invalid archive found on disk: %w", err)
 	}
-	ancestor := archive.Content
+	// Intern the freshly loaded ancestor against the daemon-wide table: it is
+	// exclusively owned here, and at steady state it is structurally identical
+	// to the endpoints' snapshots and to other sessions' ancestors over the
+	// same tree.
+	ancestor := core.SharedInterner().Intern(archive.Content)
 
 	// Compute the effective synchronization mode.
 	synchronizationMode := c.session.Configuration.SynchronizationMode
@@ -1364,7 +1374,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			if newAncestor, err := core.Apply(ancestor, ancestorChanges); err != nil {
 				return fmt.Errorf("unable to propagate changes to ancestor: %w", err)
 			} else {
-				ancestor = newAncestor
+				// Intern the new ancestor: Apply allocates fresh nodes only
+				// along the paths to changes (exclusively owned here), and
+				// everything it shares is already canonical, so this pass
+				// keeps the induction that all published trees are canonical.
+				ancestor = core.SharedInterner().Intern(newAncestor)
 			}
 
 			// Validate the new ancestor before saving it to ensure that our

@@ -1,13 +1,6 @@
-//go:build wiring_pending
-
-// This file holds the RED half of the remote endpoint's wiring contract: tests
-// that describe what interning in endpointClient.Scan must achieve and that fail
-// until it exists. It is build-tagged so that the branch stays green; run it with
-//
-//	go test -tags wiring_pending -run Pending ./pkg/synchronization/endpoint/remote/
-//
-// Its harness (connectedEndpoint, isolatedDataDirectory, populatedRoot) lives in
-// scan_roundtrip_test.go and is untagged, so it is exercised on every run: a real
+// This file holds the remote endpoint's wiring contract: what interning in
+// endpointClient.Scan must achieve. Its harness (connectedEndpoint,
+// isolatedDataDirectory, populatedRoot) lives in scan_roundtrip_test.go: a real
 // endpointClient talking to a real ServeEndpoint over net.Pipe. Nothing here
 // stubs the thing under test.
 package remote

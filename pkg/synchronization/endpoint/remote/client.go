@@ -348,6 +348,11 @@ func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bo
 		return nil, fmt.Errorf("invalid snapshot received: %w", err), false
 	}
 
+	// Intern the freshly decoded snapshot against the daemon-wide table so
+	// that it collapses onto the trees other sessions and cycles have already
+	// interned. The decoded tree is exclusively owned at this point.
+	snapshot.Content = core.SharedInterner().Intern(snapshot.Content)
+
 	// Success.
 	return snapshot, nil, false
 }

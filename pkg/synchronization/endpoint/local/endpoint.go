@@ -957,6 +957,12 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 		return err
 	}
 
+	// Intern the snapshot against the daemon-wide table before publishing it,
+	// while this goroutine still exclusively owns its freshly scanned nodes.
+	// Subtrees spliced in from the previous (already canonical) snapshot are
+	// traversed write-free.
+	snapshot.Content = core.SharedInterner().Intern(snapshot.Content)
+
 	// Update the snapshot.
 	e.snapshot = snapshot
 

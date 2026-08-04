@@ -43,16 +43,29 @@ type Interner struct {
 	insertionsSinceSweep int
 }
 
+// sharedInterner backs SharedInterner.
+var sharedInterner Interner
+
+// SharedInterner returns the process-wide interning table. Every site that
+// decodes, scans, or constructs a long-lived Entry tree interns against this
+// single table so that identical trees collapse across sessions, not just
+// within one.
+func SharedInterner() *Interner {
+	return &sharedInterner
+}
+
 // Intern returns an entry hierarchy equivalent to root in which every subtree
 // has been replaced by a canonical instance shared with all previously interned
 // equal subtrees.
 //
-// The caller must have exclusive ownership of root: Intern rewrites the content
-// maps of root and its descendants in place to point at canonical children, so
-// root must not yet be visible to any other goroutine and must not already
-// contain interned nodes. Freshly decoded and freshly scanned trees satisfy
-// this, which is why those are the intended call sites. The returned tree is
-// shared and must be treated as immutable, exactly as the Entry contract already
+// The caller must have exclusive ownership of root's non-canonical nodes:
+// Intern rewrites content maps in place where a child's identity changes, so
+// root must not yet be visible to any other goroutine. Subtrees within root
+// that are already canonical (previously published by an interning site, then
+// spliced into this tree) are traversed write-free and are safe to share with
+// concurrent readers. Freshly decoded and freshly scanned trees satisfy this,
+// which is why those are the intended call sites. The returned tree is shared
+// and must be treated as immutable, exactly as the Entry contract already
 // requires.
 func (i *Interner) Intern(root *Entry) *Entry {
 	entry, _ := i.internSubtree(root)
@@ -88,7 +101,15 @@ func (i *Interner) internSubtree(e *Entry) (*Entry, uint64) {
 	hash := e.selfHash()
 	for name, child := range e.Contents {
 		canonicalChild, childHash := i.internSubtree(child)
-		e.Contents[name] = canonicalChild
+		// Write only when the child actually changes identity. This keeps the
+		// pass write-free over subtrees that are already canonical, which is
+		// what makes it safe to intern trees that splice in previously
+		// published (and thus concurrently readable) subtrees, as accelerated
+		// scans do: published subtrees are canonical inductively, provided
+		// every publish site interns.
+		if canonicalChild != child {
+			e.Contents[name] = canonicalChild
+		}
 		// Child contributions are summed rather than sequenced because map
 		// iteration order is randomized and the hash must not depend on it.
 		hash += mixChild(name, childHash)

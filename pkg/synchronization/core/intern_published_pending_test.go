@@ -1,10 +1,7 @@
-//go:build wiring_pending
-
-// This file holds the RED half of the wiring contract: tests that describe what
-// the daemon wiring needs and that fail against the Interner as it stands. It is
-// build-tagged so that the branch stays green; run it with
-//
-//	go test -tags wiring_pending -race -run Pending ./pkg/synchronization/core/
+// This file holds the write-free half of the wiring contract: interning a tree
+// whose subtrees are already canonical performs no writes, so re-interning
+// trees that splice in published subtrees (as accelerated scans do) is safe
+// under concurrent readers.
 package core
 
 import (

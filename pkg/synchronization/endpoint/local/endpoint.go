@@ -149,7 +149,7 @@ type endpoint struct {
 	// hasher is the hasher used for scans.
 	hasher hash.Hash
 	// cache is the cache from the last successful scan on the endpoint.
-	cache *core.Cache
+	cache *core.ScanCache
 	// ignoreCache is the ignore cache from the last successful scan on the
 	// endpoint.
 	ignoreCache core.IgnoreCache
@@ -168,7 +168,7 @@ type endpoint struct {
 	// returned by Scan. This may be different than cache and is tracked
 	// separately because Transition (in order to function correctly) requires
 	// the cache corresponding to the snapshot that resulted in its operations.
-	lastReturnedScanCache *core.Cache
+	lastReturnedScanCache *core.ScanCache
 	// lastReturnedScanSnapshotDecomposesUnicode is the value of
 	// DecomposesUnicode from the last snapshot returned by Scan. Despite very
 	// likely being the same as the value in the current snapshot, it needs to
@@ -338,12 +338,13 @@ func NewEndpoint(
 	// with an empty one.
 	// TODO: Should we let validation errors bubble up? They may be indicative
 	// of something bad.
-	cache := &core.Cache{}
-	if encoding.LoadAndUnmarshalProtobuf(cachePath, cache) != nil {
-		cache = &core.Cache{}
-	} else if cache.EnsureValid() != nil {
-		cache = &core.Cache{}
+	rawCache := &core.Cache{}
+	if encoding.LoadAndUnmarshalProtobuf(cachePath, rawCache) != nil {
+		rawCache = &core.Cache{}
+	} else if rawCache.EnsureValid() != nil {
+		rawCache = &core.Cache{}
 	}
+	cache := core.NewScanCacheFromProto(rawCache)
 
 	// Check if this endpoint is running inside a sidecar container and, if so,
 	// whether or not the root exists beneath a volume mount point (which it
@@ -488,7 +489,7 @@ func (e *endpoint) saveCache(ctx context.Context, cachePath string, signal <-cha
 	// pay to avoid unnecessary disk writes, and in the common case of
 	// accelerated scanning with no re-check paths, a new cache won't be
 	// generated anyway, so we won't be carrying anything extra around.
-	var lastSavedCache *core.Cache
+	var lastSavedCache *core.ScanCache
 
 	// Track the last cache save time.
 	var lastSaveTime time.Time
@@ -517,7 +518,7 @@ func (e *endpoint) saveCache(ctx context.Context, cachePath string, signal <-cha
 
 			// Save the cache.
 			e.logger.Debug("Saving cache to disk")
-			if err := encoding.MarshalAndSaveProtobuf(cachePath, e.cache); err != nil {
+			if err := encoding.MarshalAndSaveProtobuf(cachePath, e.cache.Proto()); err != nil {
 				e.logger.Error("Cache save failed:", err)
 				e.cacheWriteError = err
 				e.scanLock.Unlock()

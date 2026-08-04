@@ -256,3 +256,24 @@ per session": between cycles a remote-endpoint session retains the ancestor
 and the local endpoint's snapshot; the decoded remote snapshot is transient.
 Structural-sharing math should count coexisting trees accordingly (the
 cross-session and ancestor/alpha sharing wins stand).
+
+## Phase 5 shipped and measured live (2026-08-04): 95.5 B/entry
+
+Cache-shard interning (boxed per-directory shards for ScanCache and
+IgnoreCache, canonicalized against a daemon-wide weak table with O(1)
+re-introduction of already-canonical shards). Developed test-first; the RED
+suite was validated as discriminating against scratch no-op and strong-table
+interners before implementation. Bench: duplicate caches cost 5–12
+retained-B/entry interned vs 165–198 flat at 2–4 copies.
+
+Live: post-GC heap **317MB / 95.5 B/entry** (3.49M entries), Sys 1.59GB —
+from 780MB / 234.7 B/entry at the end of the phase-4 soak segment. For
+context against the project's start: ~575 B/entry and 3.5GB RSS. The
+steady-churn plateau will sit above the 95.5 floor (generational deltas),
+but unchanged directories now share shards across generations and across
+same-root endpoints, so the churn premium is bounded by changed-directory
+counts rather than full cache rebuilds.
+
+Soak-segment note (pre-swap): the phase-4 daemon plateaued at 780MB /
+234.7 B/entry over ~2h of agent churn — stable, confirming the generational
+pinning analysis (no leak).

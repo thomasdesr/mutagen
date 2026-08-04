@@ -34,29 +34,6 @@ var usage = `scan_bench [-h|--help] [-p|--profile] [-d|--digest=(` + digestFlagO
            [-i|--ignore=<pattern>] <path>
 `
 
-// ignoreCachesIntersectionEqual compares two ignore caches, ensuring that keys
-// which are present in both caches have the same value. It's the closest we can
-// get to the core package's testAcceleratedCacheIsSubset without having access
-// to the members of IgnoreCacheKey.
-func ignoreCachesIntersectionEqual(first, second core.IgnoreCache) bool {
-	// Check matches from first in second.
-	for key, firstValue := range first {
-		if secondValue, ok := second[key]; ok && secondValue != firstValue {
-			return false
-		}
-	}
-
-	// Check matches from second in first.
-	for key, secondValue := range second {
-		if firstValue, ok := first[key]; ok && firstValue != secondValue {
-			return false
-		}
-	}
-
-	// Success.
-	return true
-}
-
 func main() {
 	// Parse command line arguments.
 	flagSet := pflag.NewFlagSet("scan_bench", pflag.ContinueOnError)
@@ -188,9 +165,9 @@ func main() {
 		cmd.Fatal(errors.New("snapshot mismatch"))
 	} else if !newCache.Equal(cache) {
 		cmd.Fatal(errors.New("cache mismatch"))
-	} else if len(newIgnoreCache) != len(ignoreCache) {
+	} else if newIgnoreCache.Len() != ignoreCache.Len() {
 		cmd.Fatal(errors.New("ignore cache length mismatch"))
-	} else if !ignoreCachesIntersectionEqual(newIgnoreCache, ignoreCache) {
+	} else if !newIgnoreCache.IntersectionEqual(ignoreCache) {
 		cmd.Fatal(errors.New("ignore cache mismatch"))
 	}
 
@@ -231,9 +208,9 @@ func main() {
 		cmd.Fatal(errors.New("snapshot mismatch"))
 	} else if !newCache.Equal(cache) {
 		cmd.Fatal(errors.New("cache mismatch"))
-	} else if len(newIgnoreCache) != len(ignoreCache) {
+	} else if newIgnoreCache.Len() != ignoreCache.Len() {
 		cmd.Fatal(errors.New("ignore cache length mismatch"))
-	} else if !ignoreCachesIntersectionEqual(newIgnoreCache, ignoreCache) {
+	} else if !newIgnoreCache.IntersectionEqual(ignoreCache) {
 		cmd.Fatal(errors.New("ignore cache mismatch"))
 	}
 
@@ -272,7 +249,7 @@ func main() {
 		cmd.Fatal(errors.New("snapshot mismatch"))
 	} else if !newCache.Equal(cache) {
 		cmd.Fatal(errors.New("cache mismatch"))
-	} else if !ignoreCachesIntersectionEqual(newIgnoreCache, ignoreCache) {
+	} else if !newIgnoreCache.IntersectionEqual(ignoreCache) {
 		cmd.Fatal(errors.New("ignore cache mismatch"))
 	}
 
@@ -311,7 +288,7 @@ func main() {
 		cmd.Fatal(errors.New("snapshot mismatch"))
 	} else if !newCache.Equal(cache) {
 		cmd.Fatal(errors.New("cache mismatch"))
-	} else if !ignoreCachesIntersectionEqual(newIgnoreCache, ignoreCache) {
+	} else if !newIgnoreCache.IntersectionEqual(ignoreCache) {
 		cmd.Fatal(errors.New("ignore cache mismatch"))
 	}
 
@@ -433,7 +410,7 @@ func main() {
 		}
 	}
 	start = time.Now()
-	serializedCache, err := proto.Marshal(cache)
+	serializedCache, err := proto.Marshal(cache.Proto())
 	if err != nil {
 		cmd.Fatal(fmt.Errorf("unable to serialize cache: %w", err))
 	}

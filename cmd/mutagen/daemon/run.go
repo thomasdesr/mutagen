@@ -69,9 +69,15 @@ func runMain(_ *cobra.Command, _ []string) error {
 	// go tool trace) even after the event of interest has ended. The byte
 	// bound caps the recorder's memory cost regardless of event rate.
 	if pprofAddress := os.Getenv("MUTAGEN_PPROF_ADDR"); pprofAddress != "" {
+		// The window is sized for manual post-hoc use (noticing an anomaly
+		// and dumping minutes later), not just automated capture: MinAge
+		// targets five minutes, and MaxBytes is the binding bound under
+		// heavy churn, when trace volume compresses the window well below
+		// MinAge. The ring counts toward GOMEMLIMIT, so budget for it when
+		// setting that limit.
 		flightRecorder := trace.NewFlightRecorder(trace.FlightRecorderConfig{
-			MinAge:   90 * time.Second,
-			MaxBytes: 48 << 20,
+			MinAge:   5 * time.Minute,
+			MaxBytes: 128 << 20,
 		})
 		if err := flightRecorder.Start(); err != nil {
 			logger.Error("flight recorder failed to start:", err)

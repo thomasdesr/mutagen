@@ -391,9 +391,13 @@ func startMain(_ *cobra.Command, _ []string) error {
 	}
 
 	// Flush synchronization sessions for which flushing has been requested.
+	// These sessions were just created, so their endpoints haven't yet
+	// established the watchers that draining relies on and will re-scan in full
+	// regardless of what we ask for here.
 	if len(sessionsToFlush) > 0 {
+		const forceRescan, skipWait = false, false
 		flushSelection := &selection.Selection{Specifications: sessionsToFlush}
-		if err := sync.FlushWithSelection(daemonConnection, flushSelection, false); err != nil {
+		if err := sync.FlushWithSelection(daemonConnection, flushSelection, forceRescan, skipWait); err != nil {
 			return fmt.Errorf("unable to flush synchronization session(s): %w", err)
 		}
 	}

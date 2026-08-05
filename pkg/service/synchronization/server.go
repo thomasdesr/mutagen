@@ -78,7 +78,7 @@ func (s *Server) Flush(ctx context.Context, request *FlushRequest) (*FlushRespon
 	}
 
 	// Perform flushing.
-	if err := s.manager.Flush(ctx, request.Selection, request.Prompter, request.SkipWait); err != nil {
+	if err := s.manager.Flush(ctx, request.Selection, request.Prompter, request.ForceRescan, request.SkipWait); err != nil {
 		return nil, err
 	}
 

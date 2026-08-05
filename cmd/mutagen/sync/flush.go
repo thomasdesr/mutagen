@@ -22,6 +22,7 @@ import (
 func FlushWithSelection(
 	daemonConnection *grpc.ClientConn,
 	selection *selection.Selection,
+	forceRescan bool,
 	skipWait bool,
 ) error {
 	// Initiate command line messaging.
@@ -39,9 +40,10 @@ func FlushWithSelection(
 	// Perform the flush operation, cancel prompting, and handle errors.
 	synchronizationService := synchronizationsvc.NewSynchronizationClient(daemonConnection)
 	request := &synchronizationsvc.FlushRequest{
-		Prompter:  prompter,
-		Selection: selection,
-		SkipWait:  skipWait,
+		Prompter:    prompter,
+		Selection:   selection,
+		ForceRescan: forceRescan,
+		SkipWait:    skipWait,
 	}
 	response, err := synchronizationService.Flush(context.Background(), request)
 	promptingCancel()
@@ -79,13 +81,29 @@ func flushMain(_ *cobra.Command, arguments []string) error {
 	defer daemonConnection.Close()
 
 	// Perform the flush operation.
-	return FlushWithSelection(daemonConnection, selection, flushConfiguration.skipWait)
+	return FlushWithSelection(
+		daemonConnection,
+		selection,
+		flushConfiguration.forceRescan,
+		flushConfiguration.skipWait,
+	)
 }
 
 // flushCommand is the flush command.
 var flushCommand = &cobra.Command{
-	Use:          "flush [<session>...]",
-	Short:        "Force a synchronization cycle",
+	Use:   "flush [<session>...]",
+	Short: "Force a synchronization cycle",
+	Long: `Force a synchronization cycle.
+
+Endpoints establish that their filesystem watchers have reported every change
+completed before the flush was requested and then scan with acceleration, so a
+write made before the flush is synchronized by the time it returns. Endpoints
+that have no watcher to establish this with, such as those using poll-based
+watching, re-scan their roots in full instead.
+
+Use --force-rescan to make every endpoint re-scan in full. This costs a walk of
+the entire synchronization root and is only needed when a root has changed in
+ways a filesystem watcher cannot report.`,
 	RunE:         flushMain,
 	SilenceUsage: true,
 }
@@ -99,6 +117,9 @@ var flushConfiguration struct {
 	// labelSelector encodes a label selector to be used in identifying which
 	// sessions should be paused.
 	labelSelector string
+	// forceRescan indicates whether or not endpoints should re-scan their roots
+	// in full rather than draining their filesystem watchers.
+	forceRescan bool
 	// skipWait indicates whether or not the flush operation should block until
 	// a synchronization cycle completes for each sesion requested.
 	skipWait bool
@@ -118,5 +139,6 @@ func init() {
 	// Wire up flush flags.
 	flags.BoolVarP(&flushConfiguration.all, "all", "a", false, "Flush all sessions")
 	flags.StringVar(&flushConfiguration.labelSelector, "label-selector", "", "Flush sessions matching the specified label selector")
+	flags.BoolVar(&flushConfiguration.forceRescan, "force-rescan", false, "Re-scan endpoint roots in full instead of draining filesystem watchers")
 	flags.BoolVar(&flushConfiguration.skipWait, "skip-wait", false, "Avoid waiting for the resulting synchronization cycle(s) to complete")
 }

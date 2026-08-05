@@ -108,7 +108,12 @@ func flushMain(_ *cobra.Command, _ []string) error {
 	}
 
 	// Flush synchronization sessions.
-	if err := sync.FlushWithSelection(daemonConnection, selection, flushConfiguration.skipWait); err != nil {
+	if err := sync.FlushWithSelection(
+		daemonConnection,
+		selection,
+		flushConfiguration.forceRescan,
+		flushConfiguration.skipWait,
+	); err != nil {
 		return fmt.Errorf("unable to flush synchronization session(s): %w", err)
 	}
 
@@ -131,6 +136,9 @@ var flushConfiguration struct {
 	help bool
 	// projectFile is the path to the project file, if non-default.
 	projectFile string
+	// forceRescan indicates whether or not endpoints should re-scan their roots
+	// in full rather than draining their filesystem watchers.
+	forceRescan bool
 	// skipWait indicates whether or not the flush operation should block until
 	// a synchronization cycle completes for each sesion requested.
 	skipWait bool
@@ -151,5 +159,6 @@ func init() {
 	flags.StringVarP(&flushConfiguration.projectFile, "project-file", "f", "", "Specify project file")
 
 	// Wire up flush flags.
+	flags.BoolVar(&flushConfiguration.forceRescan, "force-rescan", false, "Re-scan endpoint roots in full instead of draining filesystem watchers")
 	flags.BoolVar(&flushConfiguration.skipWait, "skip-wait", false, "Avoid waiting for the resulting synchronization cycle(s) to complete")
 }

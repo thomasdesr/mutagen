@@ -154,7 +154,7 @@ func (r *FlushRequest) ensureValid() error {
 		return fmt.Errorf("invalid selection specification: %w", err)
 	}
 
-	// Any value of SkipWait is considered valid.
+	// Any value of SkipWait or ForceRescan is considered valid.
 
 	// Success.
 	return nil

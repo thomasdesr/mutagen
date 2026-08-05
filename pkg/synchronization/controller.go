@@ -86,10 +86,22 @@ type controller struct {
 	cancel context.CancelFunc
 	// flushRequests is used pass flush requests to the synchronization loop. It
 	// is buffered, allowing a single request to be queued. All requests passed
-	// via this channel must be buffered and contain room for one error.
-	flushRequests chan chan error
+	// via this channel must have a buffered results channel with room for one
+	// error.
+	flushRequests chan *flushRequest
 	// done will be closed by the current synchronization loop when it exits.
 	done chan struct{}
+}
+
+// flushRequest is a request for the synchronization loop to perform a cycle.
+type flushRequest struct {
+	// forceRescan indicates that endpoints should re-scan their roots in full
+	// rather than proving that their filesystem watchers are current and using
+	// scan acceleration.
+	forceRescan bool
+	// results transmits the outcome of the cycle. It must be buffered with room
+	// for one error.
+	results chan error
 }
 
 // newSession creates a new session and corresponding controller.
@@ -229,7 +241,7 @@ func newSession(
 	if !paused {
 		ctx, cancel := context.WithCancel(context.Background())
 		controller.cancel = cancel
-		controller.flushRequests = make(chan chan error, 1)
+		controller.flushRequests = make(chan *flushRequest, 1)
 		controller.done = make(chan struct{})
 		go controller.run(ctx, alphaEndpoint, betaEndpoint)
 		alphaEndpoint = nil
@@ -297,7 +309,7 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, identifier stri
 	if !session.Paused {
 		ctx, cancel := context.WithCancel(context.Background())
 		controller.cancel = cancel
-		controller.flushRequests = make(chan chan error, 1)
+		controller.flushRequests = make(chan *flushRequest, 1)
 		controller.done = make(chan struct{})
 		go controller.run(ctx, nil, nil)
 	}
@@ -322,8 +334,10 @@ func (c *controller) currentState() *State {
 // flush attempts to force a synchronization cycle for the session. If wait is
 // specified, then the method will wait until a post-flush synchronization cycle
 // has completed. The provided context (which must be non-nil) can terminate
-// this wait early.
-func (c *controller) flush(ctx context.Context, prompter string, skipWait bool) error {
+// this wait early. If forceRescan is specified, then endpoints will re-scan
+// their roots in full instead of establishing that their filesystem watchers
+// are current and scanning with acceleration.
+func (c *controller) flush(ctx context.Context, prompter string, forceRescan, skipWait bool) error {
 	// Update status.
 	prompting.Message(prompter, fmt.Sprintf("Forcing synchronization cycle for session %s...", c.session.Identifier))
 
@@ -364,7 +378,10 @@ func (c *controller) flush(ctx context.Context, prompter string, skipWait bool) 
 	c.lifecycleLock.Unlock()
 
 	// Create a flush request.
-	request := make(chan error, 1)
+	request := &flushRequest{
+		forceRescan: forceRescan,
+		results:     make(chan error, 1),
+	}
 
 	// If we don't want to wait, then we can simply send the request in a
 	// non-blocking manner, in which case either this request (or one that's
@@ -399,7 +416,7 @@ func (c *controller) flush(ctx context.Context, prompter string, skipWait bool) 
 	// Now we need to wait for a response to the request, again watching for
 	// cancellation, failure, or termination.
 	select {
-	case err := <-request:
+	case err := <-request.results:
 		return err
 	case <-ctx.Done():
 		return errors.New("flush cancelled while waiting for response")
@@ -514,7 +531,7 @@ func (c *controller) resume(ctx context.Context, prompter string, lifecycleLockH
 	// loop keep trying to connect.
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
-	c.flushRequests = make(chan chan error, 1)
+	c.flushRequests = make(chan *flushRequest, 1)
 	c.done = make(chan struct{})
 	go c.run(ctx, alpha, beta)
 
@@ -866,8 +883,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.stateLock.UnlockWithoutNotify()
 	}
 
-	// Track whether or not a flush request triggered the synchronization loop.
-	var flushRequest chan error
+	// Track the flush request, if any, that triggered the synchronization loop.
+	var request *flushRequest
 
 	// Load the archive and extract the ancestor. We enforce that the archive
 	// contains only synchronizable content.
@@ -994,8 +1011,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				c.logger.Debug("Triggered by beta endpoint")
 				pollCancel()
 				αPollErr = <-αPollResults
-			case flushRequest = <-c.flushRequests:
-				if cap(flushRequest) < 1 {
+			case request = <-c.flushRequests:
+				if cap(request.results) < 1 {
 					panic("unbuffered flush request")
 				}
 				c.logger.Debug("Triggered by flush request")
@@ -1022,25 +1039,23 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			skipPolling = false
 		}
 
-		// Scan both endpoints in parallel and check for errors. If a flush
-		// request is present, then force both endpoints to perform a full
-		// (warm) re-scan rather than using acceleration.
+		// Scan both endpoints in parallel and check for errors.
 		c.logger.Debug("Scanning endpoints")
 		c.stateLock.Lock()
 		c.state.Status = Status_Scanning
 		c.stateLock.Unlock()
-		forceFullScan := flushRequest != nil
+		strategy := scanStrategyForCycle(request)
 		var αSnapshot, βSnapshot *core.Snapshot
 		var αScanErr, βScanErr error
 		var αTryAgain, βTryAgain bool
 		scanDone := &sync.WaitGroup{}
 		scanDone.Add(2)
 		go func() {
-			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, forceFullScan)
+			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, strategy)
 			scanDone.Done()
 		}()
 		go func() {
-			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, forceFullScan)
+			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, strategy)
 			scanDone.Done()
 		}()
 		scanDone.Wait()
@@ -1432,9 +1447,24 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 
 		// If a flush request triggered this synchronization cycle, then tell it
 		// that the cycle has completed and remove it from our tracking.
-		if flushRequest != nil {
-			flushRequest <- nil
-			flushRequest = nil
+		if request != nil {
+			request.results <- nil
+			request = nil
 		}
 	}
+}
+
+// scanStrategyForCycle determines how endpoints should scan for a
+// synchronization cycle. Ordinary cycles use whatever acceleration endpoints
+// have available. A flush additionally requires endpoints to establish that
+// their filesystem watchers have reported everything written before the flush,
+// which is what lets the flush return with that work synchronized; a flush that
+// explicitly asked for a re-scan gets one instead.
+func scanStrategyForCycle(request *flushRequest) ScanStrategy {
+	if request == nil {
+		return ScanStrategyAccelerated
+	} else if request.forceRescan {
+		return ScanStrategyFull
+	}
+	return ScanStrategyDrained
 }

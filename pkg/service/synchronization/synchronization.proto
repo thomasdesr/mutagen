@@ -73,6 +73,11 @@ message FlushRequest {
     selection.Selection selection = 2;
     // SkipWait indicates whether or not the operation should avoid blocking.
     bool skipWait = 3;
+    // ForceRescan indicates whether or not endpoints should re-scan their roots
+    // in full. By default, endpoints establish that their filesystem watchers
+    // have reported every change that completed before the flush and then scan
+    // with acceleration, which is far cheaper on large roots.
+    bool forceRescan = 4;
 }
 
 // FlushResponse indicates completion of flush operation(s).

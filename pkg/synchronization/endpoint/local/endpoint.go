@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -127,6 +129,22 @@ type endpoint struct {
 	// timer-based signal)). This field is static and never closed, and is thus
 	// safe for concurrent send operations.
 	recursiveWatchRetryEstablish chan struct{}
+	// drainRequests is a channel used by Scan to ask the recursive watching
+	// Goroutine to prove that it has caught up with the filesystem. It is
+	// non-buffered, so a send indicates that the watching Goroutine has taken
+	// the request. It is non-nil if and only if the endpoint uses recursive
+	// watching with acceleration allowed, which is the only configuration in
+	// which draining is both possible and useful. This field is static and never
+	// closed, and is thus safe for concurrent send operations.
+	drainRequests chan *drainRequest
+	// drainSentinelPrefix is the file name prefix for this endpoint's drain
+	// sentinels. This field is static and thus safe for concurrent reads.
+	drainSentinelPrefix string
+	// drainCount is incremented to give each drain request a distinct sentinel
+	// name. A sentinel from an abandoned drain may still be in flight, so names
+	// must not repeat. It is only accessed by Scan, which Endpoint forbids
+	// concurrent invocation of.
+	drainCount uint64
 	// scanLock serializes access to accelerate, recheckPaths, snapshot, hasher,
 	// cache, ignoreCache, cacheWriteError, and lastScanEntryCount. This lock is
 	// not necessitated by the Endpoint interface (which doesn't permit
@@ -179,6 +197,30 @@ type endpoint struct {
 	// stager will only be used in at most one of Stage or Transition methods at
 	// any given time.
 	stager stager
+}
+
+// drainRequest is a request for the recursive watching Goroutine to establish
+// that it has reported every filesystem change completed before the request was
+// made. The requester creates a sentinel file under the synchronization root
+// and the watching Goroutine answers once the watcher reports that file, at
+// which point every change that preceded it has been folded into the re-check
+// paths. See endpoint.drainWatcher for why this is a proof rather than a guess.
+type drainRequest struct {
+	// sentinel is the root-relative path of the sentinel file.
+	sentinel string
+	// results transmits the outcome of the request. It is buffered with a
+	// capacity of one and must only be written to via respond.
+	results chan error
+}
+
+// respond delivers the outcome of a drain request, discarding the outcome if
+// one has already been delivered. Both the watching Goroutine and watch
+// teardown may try to answer a request, and the requester reads at most once.
+func (r *drainRequest) respond(err error) {
+	select {
+	case r.results <- err:
+	default:
+	}
 }
 
 // NewEndpoint creates a new local endpoint instance using the specified session
@@ -425,6 +467,15 @@ func NewEndpoint(
 	// Create a channel to track the watch Goroutine.
 	watchDone := make(chan struct{})
 
+	// Create a channel for watcher drain requests, but only if the endpoint is
+	// configured such that draining is both possible (recursive watching
+	// provides an event stream to catch up with) and useful (acceleration is
+	// allowed, so there are re-check paths for the drain to complete).
+	var drainRequests chan *drainRequest
+	if actualWatchMode == reifiedWatchModeRecursive && accelerationAllowed {
+		drainRequests = make(chan *drainRequest)
+	}
+
 	// Create the endpoint.
 	endpoint := &endpoint{
 		logger:                       logger,
@@ -446,6 +497,8 @@ func NewEndpoint(
 		watchDone:                    watchDone,
 		pollSignal:                   state.NewCoalescer(pollSignalCoalescingWindow),
 		recursiveWatchRetryEstablish: make(chan struct{}),
+		drainRequests:                drainRequests,
+		drainSentinelPrefix:          prefixForDrainSentinels(sessionIdentifier, alpha),
 		hasher:                       hasherFactory(),
 		cache:                        cache,
 		stager: staging.NewStager(
@@ -799,6 +852,15 @@ WatchEstablishment:
 				logger.Debug("Received recursive watch establishment suggestion")
 				timeutil.StopAndDrainTimer(timer)
 				continue
+			case request := <-e.drainRequests:
+				// There's no event stream to catch up with, so the requester
+				// has to fall back to a full scan. Retry establishment now
+				// rather than waiting out the polling interval, since a drain
+				// request means someone is asking for an up-to-date view.
+				logger.Debug("Received drain request without an established watch")
+				request.respond(errors.New("recursive watch not established"))
+				timeutil.StopAndDrainTimer(timer)
+				continue
 			}
 		}
 		logger.Debug("Watch successfully established")
@@ -817,6 +879,10 @@ WatchEstablishment:
 			e.pollSignal.Strobe()
 		}
 
+		// Track any drain request awaiting its sentinel. It's scoped to this
+		// watch, since a sentinel in flight is lost if the watch dies.
+		var pendingDrain *drainRequest
+
 		// Loop and process events.
 		for {
 			select {
@@ -830,6 +896,11 @@ WatchEstablishment:
 					e.accelerate = false
 					e.recheckPaths = nil
 					e.scanLock.Unlock()
+				}
+
+				// Release any drain requester.
+				if pendingDrain != nil {
+					pendingDrain.respond(errors.New("watching terminated during drain"))
 				}
 
 				// Terminate watching.
@@ -868,6 +939,13 @@ WatchEstablishment:
 					e.scanLock.Unlock()
 				}
 
+				// Release any drain requester, since the sentinel that would
+				// have answered it died with the watch.
+				if pendingDrain != nil {
+					pendingDrain.respond(errors.New("recursive watching failed during drain"))
+					pendingDrain = nil
+				}
+
 				// Stop and drain the timer, which may be running.
 				timeutil.StopAndDrainTimer(timer)
 
@@ -895,7 +973,34 @@ WatchEstablishment:
 
 				// Retry watch establishment.
 				continue WatchEstablishment
+			case request := <-e.drainRequests:
+				// Log the request.
+				logger.Debug("Received drain request")
+
+				// Displace any request still awaiting its sentinel. Requests are
+				// submitted synchronously and scans are serialized, so the only
+				// way one is still outstanding is that its requester gave up.
+				// Its sentinel is uniquely named, so once it arrives it will be
+				// ignored as an ordinary temporary path.
+				if pendingDrain != nil {
+					pendingDrain.respond(errors.New("superseded by a later drain request"))
+				}
+
+				// Await the sentinel.
+				pendingDrain = request
 			case path := <-watcher.Events():
+				// Check whether this is the sentinel that a drain request is
+				// waiting on. Because the requester created that sentinel after
+				// the changes it wants covered, and because we process events in
+				// the order the watcher reports them, every one of those changes
+				// has already been registered as a re-check path below.
+				if pendingDrain != nil && path == pendingDrain.sentinel {
+					logger.Debug("Observed drain sentinel")
+					pendingDrain.respond(nil)
+					pendingDrain = nil
+					continue
+				}
+
 				// Filter temporary files and log the event. Recursive watchers
 				// return watch-root-relative paths, so we can use our fast-path
 				// base name calculation for leaf name calculations. We also
@@ -994,7 +1099,27 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 }
 
 // Scan implements the Scan method for local endpoints.
-func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Snapshot, error, bool) {
+func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, strategy synchronization.ScanStrategy) (*core.Snapshot, error, bool) {
+	// Resolve the strategy into whether or not to bypass acceleration. A drain
+	// that we can't perform leaves us unable to say whether acceleration would
+	// miss a recent change, so we fall back to a full scan, which is correct
+	// regardless. Draining has to happen before we take the scan lock, since the
+	// watching Goroutine needs that lock to register the very paths that we're
+	// waiting for it to report.
+	var full bool
+	switch strategy {
+	case synchronization.ScanStrategyAccelerated:
+	case synchronization.ScanStrategyDrained:
+		if err := e.drainWatcher(ctx); err != nil {
+			e.logger.Debug("Unable to drain watcher, falling back to a full scan:", err)
+			full = true
+		}
+	case synchronization.ScanStrategyFull:
+		full = true
+	default:
+		return nil, fmt.Errorf("unknown scan strategy: %d", strategy), false
+	}
+
 	// Grab the scan lock and defer its release.
 	e.scanLock.Lock()
 	defer e.scanLock.Unlock()
@@ -1064,6 +1189,65 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Sn
 
 	// Success.
 	return e.snapshot, nil, false
+}
+
+// drainWatcher blocks until the endpoint's filesystem watcher has reported
+// every change that completed before the call and the watching Goroutine has
+// registered those changes as re-check paths.
+//
+// It works by creating a sentinel file under the synchronization root and
+// waiting for the watching Goroutine to report seeing it. Recursive watchers
+// report changes in the order they observe them, so the sentinel's arrival
+// proves that everything which happened before its creation has arrived ahead
+// of it. That is the same ordering property every accelerated synchronization
+// cycle already relies on; the sentinel just turns it into a signal that can be
+// waited on rather than a window that has to be guessed at.
+//
+// This must not be called while holding the scan lock, since the watching
+// Goroutine needs that lock to register re-check paths. It returns an error if
+// the endpoint has no watcher to drain or if the watch fails partway through,
+// in which case the caller must not rely on scan acceleration.
+func (e *endpoint) drainWatcher(ctx context.Context) error {
+	// Bail if the endpoint has no drainable watcher.
+	if e.drainRequests == nil {
+		return errors.New("endpoint has no drainable watcher")
+	}
+
+	// Compute a sentinel name that no in-flight sentinel is using.
+	e.drainCount++
+	request := &drainRequest{
+		sentinel: e.drainSentinelPrefix + strconv.FormatUint(e.drainCount, 10),
+		results:  make(chan error, 1),
+	}
+
+	// Register the request before creating the sentinel, otherwise the watching
+	// Goroutine could report the sentinel while it still has nothing to match it
+	// against and we'd wait for an event that has already come and gone. The
+	// send is synchronous and the watching Goroutine records the request before
+	// returning to its event loop, so registration precedes any event it
+	// processes after this point.
+	select {
+	case e.drainRequests <- request:
+	case <-ctx.Done():
+		return errors.New("cancelled while submitting drain request")
+	}
+
+	// Create the sentinel and defer its removal. Both the creation and the
+	// removal generate events, but the temporary name prefix keeps them out of
+	// the re-check paths and out of scans.
+	sentinelPath := filepath.Join(e.root, request.sentinel)
+	if err := os.WriteFile(sentinelPath, nil, 0600); err != nil {
+		return fmt.Errorf("unable to create drain sentinel: %w", err)
+	}
+	defer os.Remove(sentinelPath)
+
+	// Wait for the watching Goroutine to report the sentinel.
+	select {
+	case err := <-request.results:
+		return err
+	case <-ctx.Done():
+		return errors.New("cancelled while awaiting drain")
+	}
 }
 
 // stageFromRoot attempts to perform staging from local files by using a reverse

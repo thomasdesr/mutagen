@@ -301,9 +301,15 @@ func (s *endpointServer) serveScan(request *ScanRequest) error {
 		// Create an rsync engine.
 		engine := rsync.NewEngine()
 
-		// Perform a scan and set up the response.
+		// Perform a scan and set up the response. The protocol only expresses
+		// whether or not a full scan was requested, so the endpoint hosted here
+		// never drains; see endpointClient.Scan for why that's sound.
+		strategy := synchronization.ScanStrategyAccelerated
+		if request.Full {
+			strategy = synchronization.ScanStrategyFull
+		}
 		var response *ScanResponse
-		snapshot, err, tryAgain := s.endpoint.Scan(ctx, nil, request.Full)
+		snapshot, err, tryAgain := s.endpoint.Scan(ctx, nil, strategy)
 		if err != nil {
 			response = &ScanResponse{
 				Error:    err.Error(),

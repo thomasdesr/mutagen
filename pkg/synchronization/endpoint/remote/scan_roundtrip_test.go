@@ -22,7 +22,7 @@ func TestScanRoundTripDecodesSnapshot(t *testing.T) {
 
 	client := connectedEndpoint(t, root, "session-round-trip")
 
-	snapshot, err, _ := client.Scan(context.Background(), nil, true)
+	snapshot, err, _ := client.Scan(context.Background(), nil, synchronization.ScanStrategyFull)
 	if err != nil {
 		t.Fatal("unable to scan:", err)
 	} else if snapshot.Content == nil {

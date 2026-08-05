@@ -216,7 +216,27 @@ func (c *endpointClient) Poll(ctx context.Context) error {
 }
 
 // Scan implements the Scan method for remote endpoints.
-func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bool) (*core.Snapshot, error, bool) {
+func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, strategy synchronization.ScanStrategy) (*core.Snapshot, error, bool) {
+	// Reduce the strategy to what the endpoint protocol can express. The wire
+	// format carries a single "full" flag, and agents in the field only
+	// understand that, so a drained scan is sent as an ordinary accelerated one.
+	//
+	// The asymmetry is deliberate. Draining exists so that a flush covers writes
+	// the client made locally before calling it, and those reach the remote by
+	// being transitioned to it during this very cycle, which is driven by the
+	// local endpoint's snapshot. A remote endpoint has no local writer to wait
+	// for, so nothing about the flush contract depends on it draining. Sessions
+	// between two remotes get accelerated scans on both sides, which is what
+	// every non-flush cycle already does.
+	var full bool
+	switch strategy {
+	case synchronization.ScanStrategyAccelerated, synchronization.ScanStrategyDrained:
+	case synchronization.ScanStrategyFull:
+		full = true
+	default:
+		return nil, fmt.Errorf("unknown scan strategy: %d", strategy), false
+	}
+
 	// Create an rsync engine.
 	engine := rsync.NewEngine()
 

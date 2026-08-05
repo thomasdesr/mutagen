@@ -24,13 +24,16 @@ type Endpoint interface {
 	// ancestor is passed, then it will be used as a baseline for a deltified
 	// snapshot transfer if the endpoint is remote. The ancestor may be nil, in
 	// which case the transfer of the initial snapshot may be less than optimal.
-	// The full parameter forces the function to perform a full (but still warm)
-	// scan, avoiding any acceleration that might be available on the endpoint.
-	// The function returns the scan result, any error that occurred while
-	// trying to perform the scan, and a boolean indicating whether or not to
-	// re-try the scan if an error occurred. Any non-fatal problems encountered
-	// during the scan can be extracted from the resulting content.
-	Scan(ctx context.Context, ancestor *core.Entry, full bool) (*core.Snapshot, error, bool)
+	// The strategy parameter selects how much work the endpoint must do to
+	// establish that the snapshot reflects changes that completed before the
+	// call; see ScanStrategy. An endpoint unable to honor a strategy must fall
+	// back to a stricter one rather than a weaker one, and must reject a
+	// strategy that it doesn't recognize. The function returns the scan result,
+	// any error that occurred while trying to perform the scan, and a boolean
+	// indicating whether or not to re-try the scan if an error occurred. Any
+	// non-fatal problems encountered during the scan can be extracted from the
+	// resulting content.
+	Scan(ctx context.Context, ancestor *core.Entry, strategy ScanStrategy) (*core.Snapshot, error, bool)
 
 	// Stage performs file staging on the endpoint. It accepts a list of file
 	// paths and a separate list of desired digests corresponding to those

@@ -8,6 +8,8 @@ package remote
 import (
 	"context"
 	"testing"
+
+	"github.com/mutagen-io/mutagen/pkg/synchronization"
 )
 
 // TestScanCollapsesRepeatedCyclesPending is RED: it pins the per-cycle half of
@@ -27,11 +29,11 @@ func TestScanCollapsesRepeatedCyclesPending(t *testing.T) {
 	isolatedDataDirectory(t)
 	client := connectedEndpoint(t, populatedRoot(t), "session-repeated-cycles")
 
-	first, err, _ := client.Scan(context.Background(), nil, true)
+	first, err, _ := client.Scan(context.Background(), nil, synchronization.ScanStrategyFull)
 	if err != nil {
 		t.Fatal("unable to perform first scan:", err)
 	}
-	second, err, _ := client.Scan(context.Background(), nil, true)
+	second, err, _ := client.Scan(context.Background(), nil, synchronization.ScanStrategyFull)
 	if err != nil {
 		t.Fatal("unable to perform second scan:", err)
 	}
@@ -61,11 +63,11 @@ func TestScanCollapsesAcrossSessionsPending(t *testing.T) {
 	isolatedDataDirectory(t)
 	root := populatedRoot(t)
 
-	first, err, _ := connectedEndpoint(t, root, "session-one").Scan(context.Background(), nil, true)
+	first, err, _ := connectedEndpoint(t, root, "session-one").Scan(context.Background(), nil, synchronization.ScanStrategyFull)
 	if err != nil {
 		t.Fatal("unable to scan from the first session:", err)
 	}
-	second, err, _ := connectedEndpoint(t, root, "session-two").Scan(context.Background(), nil, true)
+	second, err, _ := connectedEndpoint(t, root, "session-two").Scan(context.Background(), nil, synchronization.ScanStrategyFull)
 	if err != nil {
 		t.Fatal("unable to scan from the second session:", err)
 	}

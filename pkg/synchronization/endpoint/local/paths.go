@@ -40,6 +40,22 @@ func pathForCache(session string, alpha bool) (string, error) {
 	return filepath.Join(cachesDirectoryPath, cacheName), nil
 }
 
+// prefixForDrainSentinels computes the file name prefix for the drain sentinel
+// files of the given session identifier and endpoint role. Sentinels carry the
+// temporary name prefix so that scans and watch event processing ignore them,
+// and they carry the session and role so that endpoints sharing a
+// synchronization root can't answer each other's drains.
+func prefixForDrainSentinels(session string, alpha bool) string {
+	// Compute the endpoint name.
+	endpointName := alphaName
+	if !alpha {
+		endpointName = betaName
+	}
+
+	// Success.
+	return fmt.Sprintf("%sdrain-%s-%s-", filesystem.TemporaryNamePrefix, session, endpointName)
+}
+
 // pathForMutagenStagingRoot computes the path to the staging root in the
 // Mutagen data directory for the given session identifier and endpoint. It
 // ensures that staging subdirectory of the Mutagen data directory exists, but

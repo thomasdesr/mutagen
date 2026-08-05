@@ -130,19 +130,18 @@ type endpoint struct {
 	// safe for concurrent send operations.
 	recursiveWatchRetryEstablish chan struct{}
 	// drainRequests is a channel used by Scan to ask the recursive watching
-	// Goroutine to prove that it has caught up with the filesystem. It is
+	// Goroutine to establish that it has caught up with the filesystem. It is
 	// non-buffered, so a send indicates that the watching Goroutine has taken
-	// the request. It is non-nil if and only if the endpoint uses recursive
-	// watching with acceleration allowed, which is the only configuration in
-	// which draining is both possible and useful. This field is static and never
-	// closed, and is thus safe for concurrent send operations.
+	// the request. It is nil on endpoints that can't drain; see NewEndpoint for
+	// which those are. This field is static and never closed, and is thus safe
+	// for concurrent send operations.
 	drainRequests chan *drainRequest
 	// drainSentinelPrefix is the file name prefix for this endpoint's drain
 	// sentinels. This field is static and thus safe for concurrent reads.
 	drainSentinelPrefix string
 	// drainCount is incremented to give each drain request a distinct sentinel
 	// name. A sentinel from an abandoned drain may still be in flight, so names
-	// must not repeat. It is only accessed by Scan, which Endpoint forbids
+	// must not repeat. It is only accessed via Scan, which Endpoint forbids
 	// concurrent invocation of.
 	drainCount uint64
 	// scanLock serializes access to accelerate, recheckPaths, snapshot, hasher,
@@ -203,8 +202,8 @@ type endpoint struct {
 // that it has reported every filesystem change completed before the request was
 // made. The requester creates a sentinel file under the synchronization root
 // and the watching Goroutine answers once the watcher reports that file, at
-// which point every change that preceded it has been folded into the re-check
-// paths. See endpoint.drainWatcher for why this is a proof rather than a guess.
+// which point every change preceding it has been registered as a re-check path.
+// See endpoint.drainWatcher for the ordering property this relies on.
 type drainRequest struct {
 	// sentinel is the root-relative path of the sentinel file.
 	sentinel string
@@ -213,9 +212,9 @@ type drainRequest struct {
 	results chan error
 }
 
-// respond delivers the outcome of a drain request, discarding the outcome if
-// one has already been delivered. Both the watching Goroutine and watch
-// teardown may try to answer a request, and the requester reads at most once.
+// respond delivers the outcome of a drain request. It never blocks, so that no
+// path through the watching Goroutine can stall on a request whose requester
+// has already stopped waiting.
 func (r *drainRequest) respond(err error) {
 	select {
 	case r.results <- err:
@@ -468,11 +467,14 @@ func NewEndpoint(
 	watchDone := make(chan struct{})
 
 	// Create a channel for watcher drain requests, but only if the endpoint is
-	// configured such that draining is both possible (recursive watching
-	// provides an event stream to catch up with) and useful (acceleration is
-	// allowed, so there are re-check paths for the drain to complete).
+	// configured such that draining is possible (recursive watching provides an
+	// event stream to catch up with), useful (acceleration is allowed, so there
+	// are re-check paths for a drain to complete), and permitted (draining
+	// creates a sentinel file under the root, and a read-only endpoint is one
+	// this process must never write to). Endpoints excluded here re-scan in full
+	// when asked for a drained scan.
 	var drainRequests chan *drainRequest
-	if actualWatchMode == reifiedWatchModeRecursive && accelerationAllowed {
+	if actualWatchMode == reifiedWatchModeRecursive && accelerationAllowed && !readOnly {
 		drainRequests = make(chan *drainRequest)
 	}
 
@@ -990,10 +992,10 @@ WatchEstablishment:
 				pendingDrain = request
 			case path := <-watcher.Events():
 				// Check whether this is the sentinel that a drain request is
-				// waiting on. Because the requester created that sentinel after
-				// the changes it wants covered, and because we process events in
-				// the order the watcher reports them, every one of those changes
-				// has already been registered as a re-check path below.
+				// waiting on. The requester created that sentinel after the
+				// changes it wants covered, and we process events in the order
+				// the watcher reports them, so every one of those changes has
+				// already been registered as a re-check path.
 				if pendingDrain != nil && path == pendingDrain.sentinel {
 					logger.Debug("Observed drain sentinel")
 					pendingDrain.respond(nil)
@@ -1234,7 +1236,9 @@ func (e *endpoint) drainWatcher(ctx context.Context) error {
 
 	// Create the sentinel and defer its removal. Both the creation and the
 	// removal generate events, but the temporary name prefix keeps them out of
-	// the re-check paths and out of scans.
+	// the re-check paths and out of scans. If creation fails, the watching
+	// Goroutine keeps waiting for a sentinel that will never arrive until a
+	// later request displaces this one, which costs nothing but the wait.
 	sentinelPath := filepath.Join(e.root, request.sentinel)
 	if err := os.WriteFile(sentinelPath, nil, 0600); err != nil {
 		return fmt.Errorf("unable to create drain sentinel: %w", err)

@@ -147,6 +147,38 @@ func TestDrainedScanFallsBackWithoutWatching(t *testing.T) {
 	}
 }
 
+// TestReadOnlyEndpointDoesNotDrain verifies that a read-only endpoint has no
+// drain path at all. Draining creates a sentinel file under the synchronization
+// root, and a read-only endpoint is one that this process promises never to
+// write to, so it re-scans in full instead.
+func TestReadOnlyEndpointDoesNotDrain(t *testing.T) {
+	// Create an alpha endpoint in a one-way-safe session, which is the
+	// configuration that makes an endpoint read-only.
+	e, root := newEndpointForTest(t, &synchronization.Configuration{
+		SynchronizationMode: core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	})
+	if !e.readOnly {
+		t.Fatal("endpoint is not read-only")
+	}
+
+	// Require that the endpoint has no way to request a drain.
+	if e.drainRequests != nil {
+		t.Error("read-only endpoint accepts drain requests")
+	}
+
+	// Require that a drained scan still returns correct content.
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("data"), 0600); err != nil {
+		t.Fatal("unable to create test file:", err)
+	}
+	snapshot, err, _ := e.Scan(context.Background(), nil, synchronization.ScanStrategyDrained)
+	if err != nil {
+		t.Fatal("drained scan failed:", err)
+	}
+	if names := contentNames(snapshot); !names["file"] {
+		t.Fatalf("drained scan did not observe file, saw: %v", names)
+	}
+}
+
 // TestScanRejectsUnknownStrategy verifies that an unset or unrecognized scan
 // strategy fails loudly rather than silently selecting a scan mode.
 func TestScanRejectsUnknownStrategy(t *testing.T) {

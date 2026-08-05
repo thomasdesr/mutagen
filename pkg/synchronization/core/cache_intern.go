@@ -30,8 +30,16 @@ import (
 // A CacheInterner is safe for concurrent use and its zero value is ready to
 // use.
 type CacheInterner struct {
-	// lock guards the bucket maps. It is acquired once per shard rather than
-	// once per cache so that concurrent endpoints interleave.
+	// shards partition the table by content hash. Locking is per shard and
+	// acquired once per cache shard, so concurrent endpoints interleave
+	// across locks instead of serializing behind one mutex.
+	shards [internShardCount]cacheInternerShard
+}
+
+// cacheInternerShard is one lock-partitioned portion of a CacheInterner's
+// table.
+type cacheInternerShard struct {
+	// lock guards the shard.
 	lock sync.Mutex
 	// scanBuckets maps shard content hash to the canonical ScanCache shards
 	// carrying that hash. ScanCache and IgnoreCache shards are never
@@ -40,7 +48,7 @@ type CacheInterner struct {
 	scanBuckets map[uint64][]weak.Pointer[scanCacheShard]
 	// ignoreBuckets is the IgnoreCache equivalent of scanBuckets.
 	ignoreBuckets map[uint64][]weak.Pointer[ignoreCacheShard]
-	// insertionsSinceSweep counts insertions since the last full sweep.
+	// insertionsSinceSweep counts insertions since the shard's last sweep.
 	insertionsSinceSweep int
 }
 
@@ -101,9 +109,12 @@ func (i *CacheInterner) InternIgnoreCache(cache IgnoreCache) IgnoreCache {
 // can't see: a terminated session's caches become unreachable while nothing
 // inserts on their behalf again.
 func (i *CacheInterner) Sweep() {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	i.sweep()
+	for s := range i.shards {
+		shard := &i.shards[s]
+		shard.lock.Lock()
+		shard.sweep()
+		shard.lock.Unlock()
+	}
 }
 
 // canonicalizeScanShard returns the canonical shard equal to the provided
@@ -111,10 +122,11 @@ func (i *CacheInterner) Sweep() {
 func (i *CacheInterner) canonicalizeScanShard(shard *scanCacheShard) *scanCacheShard {
 	hash := scanShardHash(shard)
 
-	i.lock.Lock()
-	defer i.lock.Unlock()
+	tableShard := &i.shards[hash%internShardCount]
+	tableShard.lock.Lock()
+	defer tableShard.lock.Unlock()
 
-	bucket := i.scanBuckets[hash]
+	bucket := tableShard.scanBuckets[hash]
 	live := bucket[:0]
 	for _, candidate := range bucket {
 		existing := candidate.Value()
@@ -123,7 +135,7 @@ func (i *CacheInterner) canonicalizeScanShard(shard *scanCacheShard) *scanCacheS
 		}
 		live = append(live, candidate)
 		if scanShardEqual(existing, shard) {
-			i.scanBuckets[hash] = live
+			tableShard.scanBuckets[hash] = live
 			return existing
 		}
 	}
@@ -133,11 +145,11 @@ func (i *CacheInterner) canonicalizeScanShard(shard *scanCacheShard) *scanCacheS
 	// cache is published.
 	shard.internHash = hash
 	shard.interned = true
-	if i.scanBuckets == nil {
-		i.scanBuckets = make(map[uint64][]weak.Pointer[scanCacheShard])
+	if tableShard.scanBuckets == nil {
+		tableShard.scanBuckets = make(map[uint64][]weak.Pointer[scanCacheShard])
 	}
-	i.scanBuckets[hash] = append(live, weak.Make(shard))
-	i.noteInsertion()
+	tableShard.scanBuckets[hash] = append(live, weak.Make(shard))
+	tableShard.noteInsertion()
 	return shard
 }
 
@@ -146,10 +158,11 @@ func (i *CacheInterner) canonicalizeScanShard(shard *scanCacheShard) *scanCacheS
 func (i *CacheInterner) canonicalizeIgnoreShard(shard *ignoreCacheShard) *ignoreCacheShard {
 	hash := ignoreShardHash(shard)
 
-	i.lock.Lock()
-	defer i.lock.Unlock()
+	tableShard := &i.shards[hash%internShardCount]
+	tableShard.lock.Lock()
+	defer tableShard.lock.Unlock()
 
-	bucket := i.ignoreBuckets[hash]
+	bucket := tableShard.ignoreBuckets[hash]
 	live := bucket[:0]
 	for _, candidate := range bucket {
 		existing := candidate.Value()
@@ -158,35 +171,35 @@ func (i *CacheInterner) canonicalizeIgnoreShard(shard *ignoreCacheShard) *ignore
 		}
 		live = append(live, candidate)
 		if ignoreShardEqual(existing, shard) {
-			i.ignoreBuckets[hash] = live
+			tableShard.ignoreBuckets[hash] = live
 			return existing
 		}
 	}
 
 	shard.internHash = hash
 	shard.interned = true
-	if i.ignoreBuckets == nil {
-		i.ignoreBuckets = make(map[uint64][]weak.Pointer[ignoreCacheShard])
+	if tableShard.ignoreBuckets == nil {
+		tableShard.ignoreBuckets = make(map[uint64][]weak.Pointer[ignoreCacheShard])
 	}
-	i.ignoreBuckets[hash] = append(live, weak.Make(shard))
-	i.noteInsertion()
+	tableShard.ignoreBuckets[hash] = append(live, weak.Make(shard))
+	tableShard.noteInsertion()
 	return shard
 }
 
 // noteInsertion updates the insertion-scheduled sweep counter and sweeps when
-// due. It must be called with the lock held.
-func (i *CacheInterner) noteInsertion() {
-	i.insertionsSinceSweep++
-	if i.insertionsSinceSweep > (len(i.scanBuckets)+len(i.ignoreBuckets))/2+minimumSweepInterval {
-		i.sweep()
+// due. It must be called with the shard's lock held.
+func (s *cacheInternerShard) noteInsertion() {
+	s.insertionsSinceSweep++
+	if s.insertionsSinceSweep > (len(s.scanBuckets)+len(s.ignoreBuckets))/2+minimumSweepInterval/internShardCount {
+		s.sweep()
 	}
 }
 
-// sweep drops collected shards throughout both tables, along with any bucket
-// left empty. It must be called with the lock held.
-func (i *CacheInterner) sweep() {
-	i.insertionsSinceSweep = 0
-	for hash, bucket := range i.scanBuckets {
+// sweep drops collected shards throughout both of the shard's tables, along
+// with any bucket left empty. It must be called with the shard's lock held.
+func (s *cacheInternerShard) sweep() {
+	s.insertionsSinceSweep = 0
+	for hash, bucket := range s.scanBuckets {
 		live := bucket[:0]
 		for _, candidate := range bucket {
 			if candidate.Value() != nil {
@@ -194,12 +207,12 @@ func (i *CacheInterner) sweep() {
 			}
 		}
 		if len(live) == 0 {
-			delete(i.scanBuckets, hash)
+			delete(s.scanBuckets, hash)
 			continue
 		}
-		i.scanBuckets[hash] = live
+		s.scanBuckets[hash] = live
 	}
-	for hash, bucket := range i.ignoreBuckets {
+	for hash, bucket := range s.ignoreBuckets {
 		live := bucket[:0]
 		for _, candidate := range bucket {
 			if candidate.Value() != nil {
@@ -207,10 +220,10 @@ func (i *CacheInterner) sweep() {
 			}
 		}
 		if len(live) == 0 {
-			delete(i.ignoreBuckets, hash)
+			delete(s.ignoreBuckets, hash)
 			continue
 		}
-		i.ignoreBuckets[hash] = live
+		s.ignoreBuckets[hash] = live
 	}
 }
 
@@ -219,9 +232,14 @@ func (i *CacheInterner) sweep() {
 // table's size is the only externally visible evidence that eviction is
 // working.
 func (i *CacheInterner) size() int {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	return len(i.scanBuckets) + len(i.ignoreBuckets)
+	var total int
+	for s := range i.shards {
+		shard := &i.shards[s]
+		shard.lock.Lock()
+		total += len(shard.scanBuckets) + len(shard.ignoreBuckets)
+		shard.lock.Unlock()
+	}
+	return total
 }
 
 // scanShardEqual reports whether two ScanCache shards hold identical content.

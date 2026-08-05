@@ -32,16 +32,28 @@ import (
 //
 // An Interner is safe for concurrent use and its zero value is ready to use.
 type Interner struct {
-	// lock guards buckets. It is acquired once per node rather than once per
-	// Intern call so that concurrent sessions interleave instead of serializing
-	// behind each other's full-tree passes.
+	// shards partition the table by subtree hash. Locking is per shard and
+	// acquired once per node, so concurrent sessions' full-tree passes
+	// interleave across shards instead of serializing behind one mutex
+	// (which measurement showed dominating scheduling delay during
+	// concurrent rescans).
+	shards [internShardCount]internerShard
+}
+
+// internerShard is one lock-partitioned portion of an Interner's table.
+type internerShard struct {
+	// lock guards the shard.
 	lock sync.Mutex
-	// buckets maps a subtree hash to the canonical entries carrying that hash.
-	// A bucket holds more than one entry only on hash collision.
+	// buckets maps a subtree hash to the canonical entries carrying that
+	// hash. A bucket holds more than one entry only on hash collision.
 	buckets map[uint64][]weak.Pointer[Entry]
-	// insertionsSinceSweep counts insertions since the last full sweep.
+	// insertionsSinceSweep counts insertions since the shard's last sweep.
 	insertionsSinceSweep int
 }
+
+// internShardCount is the number of lock shards per interning table. Power
+// of two so that routing is a mask.
+const internShardCount = 64
 
 // sharedInterner backs SharedInterner.
 var sharedInterner Interner
@@ -79,9 +91,12 @@ func (i *Interner) Intern(root *Entry) *Entry {
 // session produces: the session's trees become unreachable and nothing inserts
 // again. Callers should call Sweep on that signal.
 func (i *Interner) Sweep() {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	i.sweep()
+	for s := range i.shards {
+		shard := &i.shards[s]
+		shard.lock.Lock()
+		shard.sweep()
+		shard.lock.Unlock()
+	}
 }
 
 // internSubtree interns a single subtree bottom-up, returning the canonical
@@ -122,14 +137,15 @@ func (i *Interner) internSubtree(e *Entry) (*Entry, uint64) {
 // canonical instance if no equal entry is known. The children of e must already
 // be canonical.
 func (i *Interner) canonicalize(e *Entry, hash uint64) *Entry {
-	i.lock.Lock()
-	defer i.lock.Unlock()
+	shard := &i.shards[hash%internShardCount]
+	shard.lock.Lock()
+	defer shard.lock.Unlock()
 
 	// Scan the bucket for an equal entry, compacting away any entries that have
 	// been collected since we last looked. Opportunistic compaction here keeps
 	// buckets short; removal of buckets that are never looked up again is handled
 	// by sweeping.
-	bucket := i.buckets[hash]
+	bucket := shard.buckets[hash]
 	live := bucket[:0]
 	for _, candidate := range bucket {
 		existing := candidate.Value()
@@ -139,34 +155,34 @@ func (i *Interner) canonicalize(e *Entry, hash uint64) *Entry {
 		live = append(live, candidate)
 		if canonicalEqual(existing, e) {
 			// Preserve the compaction we just performed before returning.
-			i.buckets[hash] = live
+			shard.buckets[hash] = live
 			return existing
 		}
 	}
 
 	// No equal entry is known, so e becomes canonical.
-	if i.buckets == nil {
-		i.buckets = make(map[uint64][]weak.Pointer[Entry])
+	if shard.buckets == nil {
+		shard.buckets = make(map[uint64][]weak.Pointer[Entry])
 	}
-	i.buckets[hash] = append(live, weak.Make(e))
+	shard.buckets[hash] = append(live, weak.Make(e))
 
 	// Buckets that are never looked up again are never compacted above, so their
 	// map entries would otherwise accumulate for every subtree the daemon has
 	// ever seen. Sweep periodically to bound that.
-	i.insertionsSinceSweep++
-	if i.insertionsSinceSweep > len(i.buckets)/2+minimumSweepInterval {
-		i.sweep()
+	shard.insertionsSinceSweep++
+	if shard.insertionsSinceSweep > len(shard.buckets)/2+minimumSweepInterval/internShardCount {
+		shard.sweep()
 	}
 
 	return e
 }
 
-// sweep drops collected entries throughout the table, along with any bucket left
-// empty. It is called with the lock held, on an insertion schedule that keeps its
-// amortized cost per insertion constant.
-func (i *Interner) sweep() {
-	i.insertionsSinceSweep = 0
-	for hash, bucket := range i.buckets {
+// sweep drops collected entries throughout the shard, along with any bucket
+// left empty. It is called with the shard's lock held, on an insertion
+// schedule that keeps its amortized cost per insertion constant.
+func (s *internerShard) sweep() {
+	s.insertionsSinceSweep = 0
+	for hash, bucket := range s.buckets {
 		live := bucket[:0]
 		for _, candidate := range bucket {
 			if candidate.Value() != nil {
@@ -174,10 +190,10 @@ func (i *Interner) sweep() {
 			}
 		}
 		if len(live) == 0 {
-			delete(i.buckets, hash)
+			delete(s.buckets, hash)
 			continue
 		}
-		i.buckets[hash] = live
+		s.buckets[hash] = live
 	}
 }
 
@@ -189,9 +205,14 @@ const minimumSweepInterval = 1024
 // tests and diagnostics: because entries are held weakly, the table's size is
 // the only externally visible evidence that eviction is working.
 func (i *Interner) size() int {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	return len(i.buckets)
+	var total int
+	for s := range i.shards {
+		shard := &i.shards[s]
+		shard.lock.Lock()
+		total += len(shard.buckets)
+		shard.lock.Unlock()
+	}
+	return total
 }
 
 // canonicalEqual reports whether two entries are equal, assuming that the

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/trace"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -89,6 +90,20 @@ func runMain(_ *cobra.Command, _ []string) error {
 				}
 			})
 		}
+		// Self-reported cumulative CPU time (user+system seconds), because
+		// macOS gates ps/top process accounting behind entitlements and
+		// silently reports zero without them. External monitors compute
+		// utilization from deltas of this value.
+		http.HandleFunc("/debug/cputime", func(w http.ResponseWriter, _ *http.Request) {
+			var usage syscall.Rusage
+			if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			seconds := float64(usage.Utime.Sec) + float64(usage.Utime.Usec)/1e6 +
+				float64(usage.Stime.Sec) + float64(usage.Stime.Usec)/1e6
+			fmt.Fprintf(w, "%.3f\n", seconds)
+		})
 		go func() {
 			logger.Info("Serving pprof diagnostics on", pprofAddress)
 			if err := http.ListenAndServe(pprofAddress, nil); err != nil {

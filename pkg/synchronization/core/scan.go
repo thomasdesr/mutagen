@@ -850,6 +850,12 @@ func Scan(
 		return nil, nil, nil, err
 	}
 
+	// Carry prior cache shards forward wherever this scan rebuilt an
+	// identical shard, so that unchanged directories keep their
+	// already-interned shard objects.
+	newCache.carryForwardFrom(cache)
+	newIgnoreCache.carryForwardFrom(ignoreCache)
+
 	// Success.
 	return &Snapshot{
 		Content:                content,

@@ -216,6 +216,31 @@ func (c IgnoreCache) set(path string, directory bool, ignored bool) {
 	shard.entries[ignoreCacheEntryKey{name, directory}] = ignored
 }
 
+// carryForwardFrom replaces this cache's shards with the old cache's shard
+// objects wherever their contents are equal, so that unchanged directories
+// keep their already-interned shards across scans (see
+// ScanCache.carryForwardFrom; ignore determinations are values, so equality
+// here is by value rather than by pointer). The receiver must be exclusively
+// owned; the old cache is only read.
+func (c IgnoreCache) carryForwardFrom(old IgnoreCache) {
+	for directory, shard := range c {
+		oldShard := old[directory]
+		if oldShard == nil || oldShard == shard || len(oldShard.entries) != len(shard.entries) {
+			continue
+		}
+		match := true
+		for key, value := range shard.entries {
+			if oldValue, ok := oldShard.entries[key]; !ok || oldValue != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			c[directory] = oldShard
+		}
+	}
+}
+
 // Len returns the total number of entries in the cache.
 func (c IgnoreCache) Len() int {
 	var total int

@@ -131,6 +131,36 @@ func (c *ScanCache) get(path string) *ScanCacheEntry {
 	return shard.entries[name]
 }
 
+// carryForwardFrom replaces this cache's shards with the old cache's shard
+// objects wherever their contents are identical, comparing entries by
+// pointer: warm scans reuse prior cache-entry pointers for unchanged files
+// (scan.go's cacheEntryReusable path), so an unchanged directory's fresh
+// shard holds exactly the old shard's pointers. Adopting the old shard makes
+// the interner's already-canonical short-circuit apply, eliminating the
+// per-scan re-hash of unchanged directories. The receiver must be exclusively
+// owned; the old cache is only read.
+func (c *ScanCache) carryForwardFrom(old *ScanCache) {
+	if c == nil || old == nil {
+		return
+	}
+	for directory, shard := range c.directories {
+		oldShard := old.directories[directory]
+		if oldShard == nil || oldShard == shard || len(oldShard.entries) != len(shard.entries) {
+			continue
+		}
+		match := true
+		for name, entry := range shard.entries {
+			if oldShard.entries[name] != entry {
+				match = false
+				break
+			}
+		}
+		if match {
+			c.directories[directory] = oldShard
+		}
+	}
+}
+
 // set stores the entry for the file named name within directory. It
 // allocates the per-directory shard on first use.
 func (c *ScanCache) set(directory, name string, entry *ScanCacheEntry) {

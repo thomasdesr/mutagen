@@ -8,6 +8,8 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/trace"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -60,8 +62,27 @@ func runMain(_ *cobra.Command, _ []string) error {
 	}
 	logger := logging.NewLogger(logLevel, os.Stderr)
 
-	// If requested via the environment, serve net/http/pprof diagnostics.
+	// If requested via the environment, serve net/http/pprof diagnostics,
+	// along with a flight recorder for post-hoc investigation: the runtime
+	// keeps a bounded ring buffer of execution-trace data, and a GET of
+	// /debug/flightrecorder snapshots the recent window (analyzable with
+	// go tool trace) even after the event of interest has ended. The byte
+	// bound caps the recorder's memory cost regardless of event rate.
 	if pprofAddress := os.Getenv("MUTAGEN_PPROF_ADDR"); pprofAddress != "" {
+		flightRecorder := trace.NewFlightRecorder(trace.FlightRecorderConfig{
+			MinAge:   90 * time.Second,
+			MaxBytes: 48 << 20,
+		})
+		if err := flightRecorder.Start(); err != nil {
+			logger.Error("flight recorder failed to start:", err)
+		} else {
+			http.HandleFunc("/debug/flightrecorder", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				if _, err := flightRecorder.WriteTo(w); err != nil {
+					logger.Error("flight recorder snapshot failure:", err)
+				}
+			})
+		}
 		go func() {
 			logger.Info("Serving pprof diagnostics on", pprofAddress)
 			if err := http.ListenAndServe(pprofAddress, nil); err != nil {
